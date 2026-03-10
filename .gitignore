@@ -1,0 +1,4 @@
+junk/
+logs/
+*.log
+*.ckpt

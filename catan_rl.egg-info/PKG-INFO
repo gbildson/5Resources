@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: catan-rl
+Version: 0.1.0
+Summary: Catan reinforcement learning environment and training stack
+Requires-Python: >=3.10
+Requires-Dist: numpy
+Requires-Dist: torch
