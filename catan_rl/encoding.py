@@ -162,7 +162,6 @@ def _compute_engineered_features(state: GameState, current_player: int) -> np.nd
 def encode_observation(
     state: GameState,
     full_info: bool = True,
-    include_engineered_features: bool = False,
 ) -> np.ndarray:
     cp = state.current_player
     out: list[np.ndarray] = []
@@ -243,8 +242,7 @@ def encode_observation(
     out.append(proposer)
     out.append(_rotate_players(state.trade_responses, cp).astype(np.float32) / 2.0)
 
-    if include_engineered_features:
-        out.append(_compute_engineered_features(state, cp))
+    out.append(_compute_engineered_features(state, cp))
 
     vec = np.concatenate(out, dtype=np.float32)
     return vec

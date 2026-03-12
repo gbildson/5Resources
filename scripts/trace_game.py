@@ -412,7 +412,6 @@ def main() -> None:
     parser.add_argument("--disable-player-trade", action="store_true")
     parser.add_argument("--trade-action-mode", choices=["guided", "full"], default="guided")
     parser.add_argument("--max-player-trade-proposals-per-turn", type=int, default=None)
-    parser.add_argument("--enhanced-obs-features", action="store_true")
     parser.add_argument("--json-out", type=str, default=None, help="Optional JSONL output file for action trace")
     parser.add_argument(
         "--show-final-board",
@@ -439,7 +438,6 @@ def main() -> None:
     model_players = set(int(x) for x in args.model_players.split(",") if x != "")
     env = CatanEnv(
         seed=args.seed,
-        enhanced_obs_features=bool(args.enhanced_obs_features),
         max_main_actions_per_turn=args.max_main_actions_per_turn,
         allow_player_trade=not args.disable_player_trade,
         trade_action_mode=args.trade_action_mode,

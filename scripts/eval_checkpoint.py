@@ -16,8 +16,8 @@ from catan_rl.training.ppo import PolicyValueNet
 from catan_rl.training.wrappers import PolicyAgent
 
 
-def _load_policy_agent(checkpoint: Path, enhanced_obs_features: bool = False) -> PolicyAgent:
-    env = CatanEnv(seed=0, enhanced_obs_features=enhanced_obs_features)
+def _load_policy_agent(checkpoint: Path) -> PolicyAgent:
+    env = CatanEnv(seed=0)
     obs, _ = env.reset(seed=0)
     model = PolicyValueNet(obs_dim=obs.shape[0], action_dim=env.action_mask().shape[0])
     model.load_state_dict(torch.load(checkpoint, map_location="cpu"))
@@ -101,7 +101,6 @@ def main() -> None:
     parser.add_argument("--disable-player-trade", action="store_true")
     parser.add_argument("--trade-action-mode", choices=["guided", "full"], default="guided")
     parser.add_argument("--max-player-trade-proposals-per-turn", type=int, default=None)
-    parser.add_argument("--enhanced-obs-features", action="store_true")
     parser.add_argument("--out", required=True, type=str)
     args = parser.parse_args()
 
@@ -111,9 +110,8 @@ def main() -> None:
     history = _load_json_or_jsonl(history_path)
     promotion = _load_json_or_jsonl(promotion_path)
 
-    policy_agent = _load_policy_agent(ckpt_path, enhanced_obs_features=bool(args.enhanced_obs_features))
+    policy_agent = _load_policy_agent(ckpt_path)
     env_kwargs = {
-        "enhanced_obs_features": bool(args.enhanced_obs_features),
         "max_main_actions_per_turn": args.max_main_actions_per_turn,
         "allow_player_trade": not args.disable_player_trade,
         "trade_action_mode": args.trade_action_mode,

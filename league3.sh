@@ -116,7 +116,6 @@ PY
   else
     echo "-> Train branch ${branch} seed=${seed} init=${init_ckpt}"
     "$PYTHON_BIN" -u scripts/train_schedule.py \
-      --enhanced-obs-features \
       --init-checkpoint "$init_ckpt" \
       --use-opponent-mixture \
       --opponent-seat-count 1 \
@@ -159,7 +158,6 @@ PY
       --max-main-actions-per-turn "$MAX_MAIN_ACTIONS" \
       --trade-action-mode "$TRADE_MODE" \
       --max-player-trade-proposals-per-turn "$MAX_TRADE_PROPOSALS" \
-      --enhanced-obs-features \
       --out "$eval_out"
   fi
 

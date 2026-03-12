@@ -1,6 +1,5 @@
 for s in 23101 23102 23103 23104 22105 23106 23107 23108 23109 23110 22111 23112; do
   python -u scripts/train_schedule.py \
-    --enhanced-obs-features \
     --init-checkpoint enh2_seed22103/checkpoints/policy_u20.pt \
     --use-opponent-mixture \
     --opponent-seat-count 1 \

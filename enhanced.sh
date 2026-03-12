@@ -1,6 +1,5 @@
 for s in 22101 22102 22103; do
   python -u scripts/train_schedule.py \
-    --enhanced-obs-features \
     --total-updates 40 \
     --report-every 10 \
     --rollout-steps 1024 \

@@ -1,6 +1,5 @@
 
 .venv/bin/python scripts/trace_game.py \
-  --enhanced-obs-features \
   --checkpoint league_runs/cycle_7/branch_A/checkpoints/policy_u10.pt \
   --seed 55 \
   --model-players 0,1,2,3 \

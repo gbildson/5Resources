@@ -283,7 +283,6 @@ def main() -> None:
     parser.add_argument("--disable-player-trade", action="store_true")
     parser.add_argument("--trade-action-mode", choices=["guided", "full"], default="guided")
     parser.add_argument("--max-player-trade-proposals-per-turn", type=int, default=None)
-    parser.add_argument("--enhanced-obs-features", action="store_true")
     parser.add_argument("--ppo-lr", type=float, default=3e-4)
     parser.add_argument("--ppo-ent-coef", type=float, default=0.01)
     parser.add_argument("--ppo-ent-coef-start", type=float, default=None)
@@ -308,7 +307,6 @@ def main() -> None:
     report_dir.mkdir(parents=True, exist_ok=True)
 
     env_kwargs = {
-        "enhanced_obs_features": bool(args.enhanced_obs_features),
         "max_main_actions_per_turn": args.max_main_actions_per_turn,
         "allow_player_trade": not args.disable_player_trade,
         "trade_action_mode": args.trade_action_mode,
@@ -438,7 +436,6 @@ def main() -> None:
             "allow_player_trade": not args.disable_player_trade,
             "trade_action_mode": args.trade_action_mode,
             "max_player_trade_proposals_per_turn": args.max_player_trade_proposals_per_turn,
-            "enhanced_obs_features": bool(args.enhanced_obs_features),
             "use_opponent_mixture": bool(args.use_opponent_mixture),
             "opponent_seat_count": args.opponent_seat_count,
             "mix_heuristic_prob": args.mix_heuristic_prob,

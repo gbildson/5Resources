@@ -34,7 +34,6 @@ class CatanEnv:
         self,
         seed: int | None = None,
         full_info_obs: bool = True,
-        enhanced_obs_features: bool = False,
         max_main_actions_per_turn: int | None = None,
         allow_player_trade: bool = True,
         trade_action_mode: str = "guided",
@@ -42,7 +41,6 @@ class CatanEnv:
     ):
         self.seed = seed
         self.full_info_obs = full_info_obs
-        self.enhanced_obs_features = enhanced_obs_features
         self.max_main_actions_per_turn = max_main_actions_per_turn
         self.allow_player_trade = allow_player_trade
         self.trade_action_mode = trade_action_mode
@@ -73,7 +71,6 @@ class CatanEnv:
         return encode_observation(
             self.state,
             full_info=self.full_info_obs if full_info is None else full_info,
-            include_engineered_features=self.enhanced_obs_features,
         )
 
     def action_mask(self) -> np.ndarray:
