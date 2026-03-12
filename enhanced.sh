@@ -1,24 +1,48 @@
-python -u scripts/train_schedule.py \
-  --enhanced-obs-features \
-  --total-updates 40 \
-  --report-every 10 \
-  --rollout-steps 1024 \
-  --games-per-seat 15 \
-  --seed 20003 \
-  --reward-shaping-vp 0.05 \
-  --reward-shaping-resource 0.001 \
-  --max-episode-steps 600 \
-  --eval-max-steps 2200 \
-  --max-main-actions-per-turn 10 \
-  --trade-action-mode guided \
-  --max-player-trade-proposals-per-turn 1 \
-  --ppo-lr 0.00005 \
-  --ppo-ent-coef 0.02 \
-  --ppo-epochs 1 \
-  --bc-warmstart \
-  --bc-steps 20000 \
-  --bc-epochs 3 \
-  --out-dir art_enh3_bootstrap
+for s in 22101 22102 22103; do
+  python -u scripts/train_schedule.py \
+    --enhanced-obs-features \
+    --total-updates 40 \
+    --report-every 10 \
+    --rollout-steps 1024 \
+    --games-per-seat 15 \
+    --seed "$s" \
+    --reward-shaping-vp 0.05 \
+    --reward-shaping-resource 0.0 \
+    --max-episode-steps 600 \
+    --eval-max-steps 2200 \
+    --max-main-actions-per-turn 10 \
+    --trade-action-mode guided \
+    --max-player-trade-proposals-per-turn 1 \
+    --ppo-lr 0.00005 \
+    --ppo-ent-coef 0.02 \
+    --ppo-epochs 1 \
+    --bc-warmstart \
+    --bc-steps 20000 \
+    --bc-epochs 3 \
+    --out-dir "ablateB_seed${s}"
+done
+
+#python -u scripts/train_schedule.py \
+#  --enhanced-obs-features \
+#  --total-updates 40 \
+#  --report-every 10 \
+#  --rollout-steps 1024 \
+#  --games-per-seat 15 \
+#  --seed 20003 \
+#  --reward-shaping-vp 0.05 \
+#  --reward-shaping-resource 0.001 \
+#  --max-episode-steps 600 \
+#  --eval-max-steps 2200 \
+#  --max-main-actions-per-turn 10 \
+#  --trade-action-mode guided \
+#  --max-player-trade-proposals-per-turn 1 \
+#  --ppo-lr 0.00005 \
+#  --ppo-ent-coef 0.02 \
+#  --ppo-epochs 1 \
+#  --bc-warmstart \
+#  --bc-steps 20000 \
+#  --bc-epochs 3 \
+#  --out-dir art_enh3_bootstrap
 
 #python -u scripts/train_schedule.py \
 #  --enhanced-obs-features \

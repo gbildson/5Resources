@@ -1,11 +1,21 @@
 .venv/bin/python scripts/trace_game.py \
-  --checkpoint  artifacts_schedule_realboard_trade_mix_overnight_seed5109/checkpoints/policy_u10.pt \
-  --seed 555 \
+  --enhanced-obs-features \
+  --checkpoint enhm3_seed23107/checkpoints/policy_u20.pt \
+  --seed 47 \
   --model-players 0,1,2,3 \
   --max-steps 50000 \
   --show-final-inspect-board \
   --show-final-inspect-topology
 
+#  --checkpoint enh2_seed22103/checkpoints/policy_u20.pt \
+#.venv/bin/python scripts/trace_game.py \
+#  --checkpoint  artifacts_schedule_realboard_trade_mix_overnight_seed5109/checkpoints/policy_u10.pt \
+#  --seed 555 \
+#  --model-players 0,1,2,3 \
+#  --max-steps 50000 \
+#  --show-final-inspect-board \
+#  --show-final-inspect-topology
+#
 
 #  --disable-player-trade \
 #  --checkpoint  artifacts_schedule_realboard_v3_long_seed456/checkpoints/policy_u1275.pt \

@@ -1,26 +1,127 @@
-
-for s in 22101 22102 22103 22104 22105 22106 22107 22108 22109 22110 22111 22112; do
+for s in 23101 23102 23103 23104 22105 23106 23107 23108 23109 23110 22111 23112; do
   python -u scripts/train_schedule.py \
-    --init-checkpoint art_enh3_bootstrap/best_checkpoint.pt \
-    --total-updates 20 \
-    --report-every 5 \
-    --rollout-steps 1024 \
-    --games-per-seat 10 \
-    --seed "$s" \
     --enhanced-obs-features \
+    --init-checkpoint enh2_seed22103/checkpoints/policy_u20.pt \
+    --use-opponent-mixture \
+    --opponent-seat-count 1 \
+    --mix-heuristic-prob 0.30 \
+    --mix-random-prob 0.10 \
+    --mix-meta-prob 0.20 \
+    --mix-frozen-prob 0.40 \
+    --mix-frozen-checkpoints "enh2_seed22103/checkpoints/policy_u20.pt,ext1_seed22108/checkpoints/policy_u20.pt" \
+    --total-updates 30 \
+    --report-every 10 \
+    --rollout-steps 1024 \
+    --games-per-seat 20 \
+    --seed "$s" \
     --reward-shaping-vp 0.05 \
-    --reward-shaping-resource 0.001 \
+    --reward-shaping-resource 0.0 \
     --max-episode-steps 600 \
     --eval-max-steps 2200 \
     --max-main-actions-per-turn 10 \
     --trade-action-mode guided \
     --max-player-trade-proposals-per-turn 1 \
-    --ppo-lr 0.000005 \
-    --ppo-ent-coef-start 0.004 \
-    --ppo-ent-coef-end 0.0025 \
-    --ppo-epochs 2 \
-    --out-dir "ext1_seed${s}"
+    --ppo-lr 0.00003 \
+    --ppo-ent-coef 0.02 \
+    --ppo-epochs 1 \
+    --out-dir "enhm3_seed${s}"
 done
+
+#python -u scripts/train_schedule.py \
+#  --enhanced-obs-features \
+#  --init-checkpoint enh2_seed22103/checkpoints/policy_u20.pt \
+#  --use-opponent-mixture \
+#  --opponent-seat-count 1 \
+#  --mix-heuristic-prob 0.40 \
+#  --mix-random-prob 0.10 \
+#  --mix-meta-prob 0.00 \
+#  --mix-frozen-prob 0.50 \
+#  --mix-frozen-checkpoints "enh2_seed22108/checkpoints/policy_u10.pt,enh2_seed22109/checkpoints/policy_u10.pt" \
+#  --total-updates 40 \
+#  --report-every 10 \
+#  --rollout-steps 1024 \
+#  --games-per-seat 20 \
+#  --seed 23002 \
+#  --reward-shaping-vp 0.05 \
+#  --reward-shaping-resource 0.0 \
+#  --max-episode-steps 600 \
+#  --eval-max-steps 2200 \
+#  --max-main-actions-per-turn 10 \
+#  --trade-action-mode guided \
+#  --max-player-trade-proposals-per-turn 1 \
+#  --ppo-lr 0.00005 \
+#  --ppo-ent-coef 0.02 \
+#  --ppo-epochs 1 \
+#  --out-dir enh__mix3_seed23002
+
+  #--mix-frozen-checkpoints "enh2_seed22103/checkpoints/policy_u20.pt,ext1_seed22108/checkpoints/policy_u20.pt" \
+
+#for s in 22101 22102 22103 22104 22105 22106 22107 22108 22109 22110 22111 22112; do
+#  python -u scripts/train_schedule.py \
+#    --init-checkpoint ext1_cont_long/checkpoints/policy_u10.pt \
+#    --enhanced-obs-features \
+#    --total-updates 30 \
+#    --report-every 10 \
+#    --rollout-steps 1024 \
+#    --games-per-seat 10 \
+#    --seed "$s" \
+#    --reward-shaping-vp 0.05 \
+#    --reward-shaping-resource 0.0 \
+#    --max-episode-steps 600 \
+#    --eval-max-steps 2200 \
+#    --max-main-actions-per-turn 10 \
+#    --trade-action-mode guided \
+#    --max-player-trade-proposals-per-turn 1 \
+#    --ppo-lr 0.00005 \
+#    --ppo-ent-coef 0.02 \
+#    --ppo-epochs 1 \
+#    --out-dir "enh2_seed${s}"
+#done
+
+#python -u scripts/train_schedule.py \
+#  --init-checkpoint ablateB_seed22101/checkpoints/policy_u20.pt \
+#  --enhanced-obs-features \
+#  --total-updates 40 \
+#  --report-every 10 \
+#  --rollout-steps 1024 \
+#  --games-per-seat 20 \
+#  --seed 22999 \
+#  --reward-shaping-vp 0.05 \
+#  --reward-shaping-resource 0.0 \
+#  --max-episode-steps 600 \
+#  --eval-max-steps 2200 \
+#  --max-main-actions-per-turn 10 \
+#  --trade-action-mode guided \
+#  --max-player-trade-proposals-per-turn 1 \
+#  --ppo-lr 0.00005 \
+#  --ppo-ent-coef 0.02 \
+#  --ppo-epochs 1 \
+#  --out-dir ext1_cont_long
+
+#  --init-checkpoint ext1_seed22108/checkpoints/policy_u20.pt \
+
+#for s in 22101 22102 22103 22104 22105 22106 22107 22108 22109 22110 22111 22112; do
+#  python -u scripts/train_schedule.py \
+#    --init-checkpoint art_enh3_bootstrap/best_checkpoint.pt \
+#    --total-updates 20 \
+#    --report-every 5 \
+#    --rollout-steps 1024 \
+#    --games-per-seat 10 \
+#    --seed "$s" \
+#    --enhanced-obs-features \
+#    --reward-shaping-vp 0.05 \
+#    --reward-shaping-resource 0.001 \
+#    --max-episode-steps 600 \
+#    --eval-max-steps 2200 \
+#    --max-main-actions-per-turn 10 \
+#    --trade-action-mode guided \
+#    --max-player-trade-proposals-per-turn 1 \
+#    --ppo-lr 0.000005 \
+#    --ppo-ent-coef-start 0.004 \
+#    --ppo-ent-coef-end 0.0025 \
+#    --ppo-epochs 2 \
+#    --out-dir "ext1_seed${s}"
+#done
 
 #    --init-checkpoint artifacts_schedule_realboard_trade_mix_overnight_seed5109/checkpoints/policy_u10.pt \
 #source .venv/bin/activate && python -u scripts/train_schedule.py \
