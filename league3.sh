@@ -10,9 +10,10 @@ set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"
 BASE_OUT="${BASE_OUT:-league_runs}"
-CYCLES="${CYCLES:-3}"
+CYCLES="${CYCLES:-8}"
 RESET_WEAKEST_FROM_CHAMP="${RESET_WEAKEST_FROM_CHAMP:-1}"
 SKIP_COMPLETED_BRANCHES="${SKIP_COMPLETED_BRANCHES:-1}"
+PARALLEL_JOBS="${PARALLEL_JOBS:-1}"
 
 # ---- Fill these before running ----
 CKPT_A="${CKPT_A:-enhm3_seed23107/checkpoints/policy_u20.pt}"
@@ -76,6 +77,95 @@ contains_csv_item() {
   return 1
 }
 
+wait_for_slot() {
+  while true; do
+    local running
+    running=$(jobs -pr | wc -l | tr -d ' ')
+    if (( running < PARALLEL_JOBS )); then
+      break
+    fi
+    sleep 1
+  done
+}
+
+run_branch_cycle() {
+  local idx="$1"
+  local cycle="$2"
+  local cycle_dir="$3"
+
+  local branch init_ckpt seed meta_prob heuristic_prob out_dir best_ckpt eval_out
+  branch="${BRANCHES[$idx]}"
+  init_ckpt="${CURRENT_CKPTS[$idx]}"
+  seed=$(( BRANCH_SEED_BASES[$idx] + cycle ))
+  meta_prob="${BRANCH_META_MIX[$idx]}"
+  heuristic_prob=$(python3 - <<PY
+mix_random = float("$MIX_RANDOM")
+mix_frozen = float("$MIX_FROZEN")
+mix_meta = float("$meta_prob")
+v = 1.0 - (mix_random + mix_frozen + mix_meta)
+print(max(0.0, v))
+PY
+)
+  out_dir="$cycle_dir/branch_${branch}"
+  mkdir -p "$out_dir"
+  best_ckpt="$out_dir/best_checkpoint.pt"
+  eval_out="$out_dir/eval_both.json"
+
+  if [[ "$SKIP_COMPLETED_BRANCHES" == "1" && -f "$best_ckpt" ]]; then
+    echo "-> Skip train branch ${branch}; found existing $best_ckpt"
+  else
+    echo "-> Train branch ${branch} seed=${seed} init=${init_ckpt}"
+    "$PYTHON_BIN" -u scripts/train_schedule.py \
+      --enhanced-obs-features \
+      --init-checkpoint "$init_ckpt" \
+      --use-opponent-mixture \
+      --opponent-seat-count 1 \
+      --mix-heuristic-prob "$heuristic_prob" \
+      --mix-random-prob "$MIX_RANDOM" \
+      --mix-meta-prob "$meta_prob" \
+      --mix-frozen-prob "$MIX_FROZEN" \
+      --mix-frozen-checkpoints "$FROZEN_POOL_CSV" \
+      --total-updates "$TOTAL_UPDATES" \
+      --report-every "$REPORT_EVERY" \
+      --rollout-steps "$ROLLOUT_STEPS" \
+      --games-per-seat "$GAMES_PER_SEAT" \
+      --seed "$seed" \
+      --reward-shaping-vp "$REWARD_SHAPING_VP" \
+      --reward-shaping-resource "$REWARD_SHAPING_RESOURCE" \
+      --max-episode-steps "$MAX_EPISODE_STEPS" \
+      --eval-max-steps "$EVAL_MAX_STEPS" \
+      --max-main-actions-per-turn "$MAX_MAIN_ACTIONS" \
+      --trade-action-mode "$TRADE_MODE" \
+      --max-player-trade-proposals-per-turn "$MAX_TRADE_PROPOSALS" \
+      --ppo-lr "$PPO_LR" \
+      --ppo-ent-coef "$PPO_ENT_COEF" \
+      --ppo-epochs "$PPO_EPOCHS" \
+      --out-dir "$out_dir"
+  fi
+
+  [[ -f "$best_ckpt" ]] || die "Missing best checkpoint for branch ${branch}: $best_ckpt"
+
+  if [[ "$SKIP_COMPLETED_BRANCHES" == "1" && -f "$eval_out" ]]; then
+    echo "-> Skip eval branch ${branch}; found existing $eval_out"
+  else
+    "$PYTHON_BIN" -u scripts/eval_checkpoint.py \
+      --checkpoint "$best_ckpt" \
+      --training-history "$out_dir/progress_reports.jsonl" \
+      --promotion-decision "$out_dir/best_checkpoint_meta.json" \
+      --games-per-seat 12 \
+      --seed "$seed" \
+      --opponent both \
+      --max-steps "$EVAL_MAX_STEPS" \
+      --max-main-actions-per-turn "$MAX_MAIN_ACTIONS" \
+      --trade-action-mode "$TRADE_MODE" \
+      --max-player-trade-proposals-per-turn "$MAX_TRADE_PROPOSALS" \
+      --enhanced-obs-features \
+      --out "$eval_out"
+  fi
+
+  [[ -f "$eval_out" ]] || die "Missing eval output for branch ${branch}: $eval_out"
+}
+
 assert_python
 require_checkpoint "CKPT_A" "$CKPT_A"
 require_checkpoint "CKPT_B" "$CKPT_B"
@@ -98,78 +188,32 @@ for cycle in $(seq 1 "$CYCLES"); do
 
   NEXT_CKPTS=("" "" "")
   eval_files=()
+  branch_pids=()
+
+  for idx in 0 1 2; do
+    if (( PARALLEL_JOBS > 1 )); then
+      wait_for_slot
+      run_branch_cycle "$idx" "$cycle" "$cycle_dir" &
+      branch_pids+=("$!")
+    else
+      run_branch_cycle "$idx" "$cycle" "$cycle_dir"
+    fi
+  done
+
+  if (( PARALLEL_JOBS > 1 )); then
+    for pid in "${branch_pids[@]}"; do
+      wait "$pid" || die "A parallel branch job failed in cycle ${cycle}"
+    done
+  fi
 
   for idx in 0 1 2; do
     branch="${BRANCHES[$idx]}"
-    init_ckpt="${CURRENT_CKPTS[$idx]}"
-    seed=$(( BRANCH_SEED_BASES[$idx] + cycle ))
-    meta_prob="${BRANCH_META_MIX[$idx]}"
-    heuristic_prob=$(python3 - <<PY
-mix_random = float("$MIX_RANDOM")
-mix_frozen = float("$MIX_FROZEN")
-mix_meta = float("$meta_prob")
-v = 1.0 - (mix_random + mix_frozen + mix_meta)
-print(max(0.0, v))
-PY
-)
     out_dir="$cycle_dir/branch_${branch}"
-    mkdir -p "$out_dir"
     best_ckpt="$out_dir/best_checkpoint.pt"
     eval_out="$out_dir/eval_both.json"
-
-    if [[ "$SKIP_COMPLETED_BRANCHES" == "1" && -f "$best_ckpt" ]]; then
-      echo "-> Skip train branch ${branch}; found existing $best_ckpt"
-    else
-      echo "-> Train branch ${branch} seed=${seed} init=${init_ckpt}"
-      "$PYTHON_BIN" -u scripts/train_schedule.py \
-        --enhanced-obs-features \
-        --init-checkpoint "$init_ckpt" \
-        --use-opponent-mixture \
-        --opponent-seat-count 1 \
-        --mix-heuristic-prob "$heuristic_prob" \
-        --mix-random-prob "$MIX_RANDOM" \
-        --mix-meta-prob "$meta_prob" \
-        --mix-frozen-prob "$MIX_FROZEN" \
-        --mix-frozen-checkpoints "$FROZEN_POOL_CSV" \
-        --total-updates "$TOTAL_UPDATES" \
-        --report-every "$REPORT_EVERY" \
-        --rollout-steps "$ROLLOUT_STEPS" \
-        --games-per-seat "$GAMES_PER_SEAT" \
-        --seed "$seed" \
-        --reward-shaping-vp "$REWARD_SHAPING_VP" \
-        --reward-shaping-resource "$REWARD_SHAPING_RESOURCE" \
-        --max-episode-steps "$MAX_EPISODE_STEPS" \
-        --eval-max-steps "$EVAL_MAX_STEPS" \
-        --max-main-actions-per-turn "$MAX_MAIN_ACTIONS" \
-        --trade-action-mode "$TRADE_MODE" \
-        --max-player-trade-proposals-per-turn "$MAX_TRADE_PROPOSALS" \
-        --ppo-lr "$PPO_LR" \
-        --ppo-ent-coef "$PPO_ENT_COEF" \
-        --ppo-epochs "$PPO_EPOCHS" \
-        --out-dir "$out_dir"
-    fi
-
     [[ -f "$best_ckpt" ]] || die "Missing best checkpoint for branch ${branch}: $best_ckpt"
+    [[ -f "$eval_out" ]] || die "Missing eval output for branch ${branch}: $eval_out"
     NEXT_CKPTS[$idx]="$best_ckpt"
-
-    if [[ "$SKIP_COMPLETED_BRANCHES" == "1" && -f "$eval_out" ]]; then
-      echo "-> Skip eval branch ${branch}; found existing $eval_out"
-    else
-      "$PYTHON_BIN" -u scripts/eval_checkpoint.py \
-        --checkpoint "$best_ckpt" \
-        --training-history "$out_dir/progress_reports.jsonl" \
-        --promotion-decision "$out_dir/best_checkpoint_meta.json" \
-        --games-per-seat 12 \
-        --seed "$seed" \
-        --opponent both \
-        --max-steps "$EVAL_MAX_STEPS" \
-        --max-main-actions-per-turn "$MAX_MAIN_ACTIONS" \
-        --trade-action-mode "$TRADE_MODE" \
-        --max-player-trade-proposals-per-turn "$MAX_TRADE_PROPOSALS" \
-        --enhanced-obs-features \
-        --out "$eval_out"
-    fi
-
     eval_files+=("$eval_out")
   done
 

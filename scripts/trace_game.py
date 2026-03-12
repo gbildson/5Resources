@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Iterable
 
 import numpy as np
@@ -82,6 +82,69 @@ def _print_top_actions(top: Iterable[tuple[int, float]]) -> None:
     for a_id, p in top:
         rendered.append(f"{_format_action(CATALOG.decode(a_id))}:{p:.3f}")
     print("  policy_top5:", " | ".join(rendered) if rendered else "n/a")
+
+
+TRADE_KINDS = {"PROPOSE_TRADE", "ACCEPT_TRADE", "REJECT_TRADE", "BANK_TRADE"}
+
+
+def _record_trade_event(
+    events: list[dict],
+    *,
+    step: int,
+    player: int,
+    role: str,
+    phase: str,
+    action_id: int,
+) -> None:
+    action = CATALOG.decode(action_id)
+    if action.kind not in TRADE_KINDS:
+        return
+    events.append(
+        {
+            "step": int(step),
+            "player": int(player),
+            "role": role,
+            "phase": phase,
+            "action_id": int(action_id),
+            "action": _format_action(action),
+            "kind": action.kind,
+        }
+    )
+
+
+def _print_trade_summary(events: list[dict]) -> None:
+    print("\n=== Trade Summary ===")
+    if not events:
+        print("No trade actions recorded.")
+        print("=====================")
+        return
+
+    by_kind = Counter(e["kind"] for e in events)
+    by_player: dict[int, Counter] = defaultdict(Counter)
+    for e in events:
+        by_player[int(e["player"])][str(e["kind"])] += 1
+
+    print(f"total_trade_actions={len(events)}")
+    for kind in ("PROPOSE_TRADE", "ACCEPT_TRADE", "REJECT_TRADE", "BANK_TRADE"):
+        print(f"{kind}={int(by_kind.get(kind, 0))}")
+
+    print("\nper_player_trade_counts:")
+    for p in range(4):
+        c = by_player.get(p, Counter())
+        print(
+            f"  P{p}: propose={int(c.get('PROPOSE_TRADE', 0))} "
+            f"accept={int(c.get('ACCEPT_TRADE', 0))} "
+            f"reject={int(c.get('REJECT_TRADE', 0))} "
+            f"bank={int(c.get('BANK_TRADE', 0))}"
+        )
+
+    print("\nlast_trade_events:")
+    for e in events[-12:]:
+        print(
+            f"  step={int(e['step']):04d} player={int(e['player'])} "
+            f"role={str(e['role']):9s} phase={str(e['phase']):15s} action={str(e['action'])}"
+        )
+    print("=====================")
 
 
 def _format_resources(resources: np.ndarray) -> str:
@@ -392,6 +455,7 @@ def main() -> None:
     _print_setup(env)
 
     out_f = open(args.json_out, "w", encoding="utf-8") if args.json_out else None
+    trade_events: list[dict] = []
     try:
         for step in range(1, args.max_steps + 1):
             if env.state.phase == Phase.GAME_OVER:
@@ -414,6 +478,14 @@ def main() -> None:
             )
             if top:
                 _print_top_actions(top)
+            _record_trade_event(
+                trade_events,
+                step=step,
+                player=player,
+                role=role,
+                phase=phase,
+                action_id=action_id,
+            )
 
             result = env.step(action_id)
             if out_f:
@@ -447,6 +519,7 @@ def main() -> None:
         print(f"public_vp={env.state.public_vp.tolist()}")
         print(f"actual_vp={env.state.actual_vp.tolist()}")
         print("===================")
+        _print_trade_summary(trade_events)
         if args.show_final_board:
             _print_final_board(env)
         if args.show_final_inspect_board:

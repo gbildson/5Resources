@@ -1,12 +1,17 @@
+
 .venv/bin/python scripts/trace_game.py \
   --enhanced-obs-features \
-  --checkpoint enhm3_seed23107/checkpoints/policy_u20.pt \
-  --seed 47 \
+  --checkpoint league_runs/cycle_7/branch_A/checkpoints/policy_u10.pt \
+  --seed 55 \
   --model-players 0,1,2,3 \
+  --max-main-actions-per-turn 10 \
+  --trade-action-mode guided \
+  --max-player-trade-proposals-per-turn 1 \
   --max-steps 50000 \
   --show-final-inspect-board \
   --show-final-inspect-topology
 
+#  --checkpoint enhm3_seed23107/checkpoints/policy_u20.pt \
 #  --checkpoint enh2_seed22103/checkpoints/policy_u20.pt \
 #.venv/bin/python scripts/trace_game.py \
 #  --checkpoint  artifacts_schedule_realboard_trade_mix_overnight_seed5109/checkpoints/policy_u10.pt \
