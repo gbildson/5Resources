@@ -1,7 +1,7 @@
-for s in 22101 22102 22103; do
+for s in 104; do
   python -u scripts/train_schedule.py \
-    --total-updates 40 \
-    --report-every 10 \
+    --total-updates 20 \
+    --report-every 5 \
     --rollout-steps 1024 \
     --games-per-seat 15 \
     --seed "$s" \
@@ -18,7 +18,7 @@ for s in 22101 22102 22103; do
     --bc-warmstart \
     --bc-steps 20000 \
     --bc-epochs 3 \
-    --out-dir "ablateB_seed${s}"
+    --out-dir "boot_seed${s}"
 done
 
 #python -u scripts/train_schedule.py \

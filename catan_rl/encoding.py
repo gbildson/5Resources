@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections import deque
+
 import numpy as np
 
-from .constants import Building, NUM_PLAYERS, NUM_RESOURCES, RESOURCE_COSTS
+from .constants import Building, NUM_PLAYERS, NUM_RESOURCES, Phase, RESOURCE_COSTS
 from .state import GameState
 
 
@@ -50,6 +52,184 @@ def _expansion_potential(state: GameState, player: int) -> tuple[int, int]:
             road_count += 1
             continue
     return settle_count, road_count
+
+
+def _is_distance_rule_open(state: GameState, vertex: int) -> bool:
+    if int(state.vertex_building[vertex]) != int(Building.EMPTY):
+        return False
+    for n in state.topology.vertex_to_vertices[vertex]:
+        if n >= 0 and int(state.vertex_building[int(n)]) != int(Building.EMPTY):
+            return False
+    return True
+
+
+def _vertex_resource_pips(state: GameState, vertex: int, *, robber_aware: bool) -> np.ndarray:
+    out = np.zeros(NUM_RESOURCES, dtype=np.float32)
+    for h in state.topology.vertex_to_hexes[vertex]:
+        if h < 0:
+            continue
+        if robber_aware and int(h) == int(state.robber_hex):
+            continue
+        terrain = int(state.hex_terrain[h])
+        if terrain <= 0:
+            continue
+        out[terrain - 1] += float(state.hex_pip_count[h])
+    return out
+
+
+def _global_resource_pips(state: GameState) -> np.ndarray:
+    out = np.zeros(NUM_RESOURCES, dtype=np.float32)
+    for h in range(len(state.hex_terrain)):
+        terrain = int(state.hex_terrain[h])
+        if terrain <= 0:
+            continue
+        out[terrain - 1] += float(state.hex_pip_count[h])
+    return out
+
+
+def _self_production_profile(state: GameState, player: int) -> np.ndarray:
+    prof = np.zeros(NUM_RESOURCES, dtype=np.float32)
+    for v in range(len(state.vertex_owner)):
+        if int(state.vertex_owner[v]) != player:
+            continue
+        b = int(state.vertex_building[v])
+        if b == int(Building.EMPTY):
+            continue
+        mult = 2.0 if b == int(Building.CITY) else 1.0
+        prof += mult * _vertex_resource_pips(state, v, robber_aware=False)
+    return prof
+
+
+def _top3(values: list[float]) -> np.ndarray:
+    if not values:
+        return np.zeros(3, dtype=np.float32)
+    top = sorted(values, reverse=True)[:3]
+    while len(top) < 3:
+        top.append(0.0)
+    return np.asarray(top, dtype=np.float32)
+
+
+def _setup_settlement_score(
+    state: GameState,
+    vertex: int,
+    self_prod: np.ndarray,
+    global_pips: np.ndarray,
+) -> float:
+    vec = _vertex_resource_pips(state, vertex, robber_aware=False)
+    pips_total = float(vec.sum())
+    diversity = float(np.count_nonzero(vec > 0))
+    ows_synergy = float(min(vec[2], vec[3], vec[4]))  # sheep/wheat/ore
+    road_synergy = float(min(vec[0], vec[1]))  # wood/brick
+    weighted = float(1.2 * vec[3] + 1.15 * vec[4] + 1.0 * vec[2] + 0.9 * vec[0] + 0.9 * vec[1])
+    missing_mask = (self_prod <= 1.0).astype(np.float32)
+    complement = float((vec * missing_mask).sum())
+    scarcity = float(np.sum(vec / np.maximum(1.0, global_pips)))
+    return pips_total + 0.7 * diversity + 0.25 * (ows_synergy + road_synergy) + 0.08 * weighted + 0.15 * complement + 2.5 * scarcity
+
+
+def _frontier_costs(state: GameState, player: int) -> np.ndarray:
+    topo = state.topology
+    n_vertices = len(state.vertex_owner)
+    inf = 10_000
+    dist = np.full(n_vertices, inf, dtype=np.int32)
+    dq: deque[int] = deque()
+    for v in range(n_vertices):
+        owned_building = int(state.vertex_owner[v]) == player and int(state.vertex_building[v]) != int(Building.EMPTY)
+        has_road = any(e >= 0 and int(state.edge_owner[int(e)]) == player for e in topo.vertex_to_edges[v])
+        if owned_building or has_road:
+            dist[v] = 0
+            dq.append(v)
+
+    while dq:
+        v = dq.popleft()
+        base = int(dist[v])
+        for e in topo.vertex_to_edges[v]:
+            if e < 0:
+                continue
+            owner = int(state.edge_owner[int(e)])
+            if owner >= 0 and owner != player:
+                continue
+            w = 0 if owner == player else 1
+            u = int(topo.edge_to_vertices[int(e), 0])
+            t = int(topo.edge_to_vertices[int(e), 1])
+            nxt = t if u == v else u
+            cand = base + w
+            if cand < int(dist[nxt]):
+                dist[nxt] = cand
+                if w == 0:
+                    dq.appendleft(nxt)
+                else:
+                    dq.append(nxt)
+    return dist.astype(np.float32)
+
+
+def _roads_needed_to_reach_site(state: GameState, player: int, vertex: int, frontier_cost: np.ndarray) -> int | None:
+    if any(e >= 0 and int(state.edge_owner[int(e)]) == player for e in state.topology.vertex_to_edges[vertex]):
+        return 0
+    best = 10_000
+    for e in state.topology.vertex_to_edges[vertex]:
+        if e < 0:
+            continue
+        owner = int(state.edge_owner[int(e)])
+        if owner >= 0 and owner != player:
+            continue
+        u = int(state.topology.edge_to_vertices[int(e), 0])
+        v = int(state.topology.edge_to_vertices[int(e), 1])
+        other = v if u == vertex else u
+        cand = int(frontier_cost[other]) + 1
+        best = min(best, cand)
+    return None if best > 2 else best
+
+
+def _site_contention(state: GameState, player: int, vertex: int) -> float:
+    opp_road_adj = 0.0
+    for e in state.topology.vertex_to_edges[vertex]:
+        if e >= 0 and int(state.edge_owner[int(e)]) >= 0 and int(state.edge_owner[int(e)]) != player:
+            opp_road_adj += 1.0
+    opp_building_adj = 0.0
+    for n in state.topology.vertex_to_vertices[vertex]:
+        if n >= 0 and int(state.vertex_owner[int(n)]) >= 0 and int(state.vertex_owner[int(n)]) != player:
+            opp_building_adj += 1.0
+    return opp_road_adj + 0.5 * opp_building_adj
+
+
+def _count_connected_settlement_opportunities(state: GameState, player: int, extra_edges: set[int] | None = None) -> int:
+    extra = extra_edges or set()
+    topo = state.topology
+    count = 0
+    for v in range(len(state.vertex_owner)):
+        if not _is_distance_rule_open(state, v):
+            continue
+        connected = False
+        for e in topo.vertex_to_edges[v]:
+            if e < 0:
+                continue
+            if int(state.edge_owner[int(e)]) == player or int(e) in extra:
+                connected = True
+                break
+        if connected:
+            count += 1
+    return count
+
+
+def _road_candidates(state: GameState, player: int) -> list[int]:
+    topo = state.topology
+    out: list[int] = []
+    for e in range(len(state.edge_owner)):
+        if int(state.edge_owner[e]) >= 0:
+            continue
+        u = int(topo.edge_to_vertices[e, 0])
+        v = int(topo.edge_to_vertices[e, 1])
+        own_building_touch = (
+            (int(state.vertex_owner[u]) == player and int(state.vertex_building[u]) != int(Building.EMPTY))
+            or (int(state.vertex_owner[v]) == player and int(state.vertex_building[v]) != int(Building.EMPTY))
+        )
+        own_road_touch = any(x >= 0 and int(state.edge_owner[int(x)]) == player for x in topo.vertex_to_edges[u]) or any(
+            x >= 0 and int(state.edge_owner[int(x)]) == player for x in topo.vertex_to_edges[v]
+        )
+        if own_building_touch or own_road_touch:
+            out.append(e)
+    return out
 
 
 def _compute_engineered_features(state: GameState, current_player: int) -> np.ndarray:
@@ -156,7 +336,71 @@ def _compute_engineered_features(state: GameState, current_player: int) -> np.nd
     self_vp = float(public_vp_rot[0])
     out.extend((np.clip((public_vp_rot[1:] - self_vp) / 10.0, -1.0, 1.0)).astype(np.float32).tolist())
 
+    # Phase-aware tactical planning helpers (top-3 summaries).
+    is_setup_settlement = 1.0 if int(s.phase) == int(Phase.SETUP_SETTLEMENT) else 0.0
+    is_main = 1.0 if int(s.phase) == int(Phase.MAIN) else 0.0
+    self_prod = _self_production_profile(s, cp)
+    global_pips = _global_resource_pips(s)
+
+    setup_scores: list[float] = []
+    for v in range(len(s.vertex_owner)):
+        if not _is_distance_rule_open(s, v):
+            continue
+        score = _setup_settlement_score(s, v, self_prod=self_prod, global_pips=global_pips)
+        setup_scores.append(float(np.clip(score / 25.0, 0.0, 1.0)))
+    out.extend((_top3(setup_scores) * is_setup_settlement).tolist())  # 3
+
+    main_settle_scores: list[float] = []
+    frontier_cost = _frontier_costs(s, cp)
+    for v in range(len(s.vertex_owner)):
+        if not _is_distance_rule_open(s, v):
+            continue
+        roads_needed = _roads_needed_to_reach_site(s, cp, v, frontier_cost)
+        if roads_needed is None:
+            continue
+        vec = _vertex_resource_pips(s, v, robber_aware=True)
+        quality = float(vec.sum()) + 0.7 * float(np.count_nonzero(vec > 0))
+        missing_mask = (self_prod <= 1.0).astype(np.float32)
+        quality += 0.2 * float((vec * missing_mask).sum())
+        contention = _site_contention(s, cp, v)
+        score = quality - 1.5 * float(roads_needed) - 0.6 * contention
+        main_settle_scores.append(float(np.clip((score + 4.0) / 12.0, 0.0, 1.0)))
+    out.extend((_top3(main_settle_scores) * is_main).tolist())  # 3
+
+    city_deltas: list[float] = []
+    for v in range(len(s.vertex_owner)):
+        if int(s.vertex_owner[v]) != cp or int(s.vertex_building[v]) != int(Building.SETTLEMENT):
+            continue
+        delta = float(_vertex_resource_pips(s, v, robber_aware=True).sum())
+        city_deltas.append(float(np.clip(delta / 15.0, 0.0, 1.0)))
+    out.extend(_top3(city_deltas).tolist())  # 3
+
+    road_gain_scores: list[float] = []
+    before_settle = _count_connected_settlement_opportunities(s, cp)
+    for e in _road_candidates(s, cp):
+        after_settle = _count_connected_settlement_opportunities(s, cp, extra_edges={int(e)})
+        gain = max(0.0, float(after_settle - before_settle))
+        road_gain_scores.append(float(np.clip(gain / 6.0, 0.0, 1.0)))
+    out.extend(_top3(road_gain_scores).tolist())  # 3
+
     return np.asarray(out, dtype=np.float32)
+
+
+def engineered_feature_summary(state: GameState, current_player: int | None = None) -> dict[str, list[float]]:
+    """Return a compact summary of the newest planning-oriented engineered features.
+
+    The summary is extracted from the tail of the engineered feature vector:
+    [setup_top3, main_top3, city_delta_top3, road_gain_top3].
+    """
+    cp = state.current_player if current_player is None else int(current_player)
+    feat = _compute_engineered_features(state, cp)
+    tail = feat[-12:]
+    return {
+        "setup_settlement_quality_top3": tail[0:3].astype(np.float32).tolist(),
+        "main_settlement_opportunity_top3": tail[3:6].astype(np.float32).tolist(),
+        "city_delta_top3": tail[6:9].astype(np.float32).tolist(),
+        "road_opportunity_gain_top3": tail[9:12].astype(np.float32).tolist(),
+    }
 
 
 def encode_observation(

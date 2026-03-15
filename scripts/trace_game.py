@@ -12,8 +12,10 @@ import torch
 
 from catan_rl.actions import CATALOG, Action
 from catan_rl.bots import HeuristicAgent, RandomLegalAgent
-from catan_rl.constants import Building, Phase
+from catan_rl.constants import Building, DevCard, INITIAL_DEV_DECK, Phase
+from catan_rl.encoding import engineered_feature_summary
 from catan_rl.env import CatanEnv
+from catan_rl.training.self_play import setup_settlement_shaping_details
 from catan_rl.training.ppo import PolicyValueNet
 
 
@@ -44,14 +46,30 @@ def _format_action(action: Action) -> str:
     return f"{action.kind}{tuple(int(x) for x in action.params)}"
 
 
-def _policy_choice_with_probs(model: PolicyValueNet, obs: np.ndarray, mask: np.ndarray) -> tuple[int, list[tuple[int, float]]]:
+def _policy_choice_with_probs(
+    model: PolicyValueNet,
+    obs: np.ndarray,
+    mask: np.ndarray,
+    *,
+    sample_policy: bool = False,
+    policy_temperature: float = 1.0,
+    rng: np.random.Generator | None = None,
+) -> tuple[int, list[tuple[int, float]]]:
     with torch.no_grad():
         obs_t = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
         mask_t = torch.as_tensor(mask, dtype=torch.float32).unsqueeze(0)
         logits, _ = model(obs_t)
         logits = logits.masked_fill(mask_t <= 0, -1e9)
+        if policy_temperature <= 0:
+            raise ValueError("--policy-temperature must be > 0.")
+        logits = logits / float(policy_temperature)
         probs = torch.softmax(logits, dim=-1).squeeze(0).cpu().numpy()
-    action_id = int(np.argmax(probs))
+    if sample_policy:
+        if rng is None:
+            rng = np.random.default_rng()
+        action_id = int(rng.choice(np.arange(len(probs)), p=probs))
+    else:
+        action_id = int(np.argmax(probs))
     top_ids = np.argsort(probs)[-5:][::-1]
     top = [(int(i), float(probs[i])) for i in top_ids if probs[i] > 0.0]
     return action_id, top
@@ -145,6 +163,180 @@ def _print_trade_summary(events: list[dict]) -> None:
             f"role={str(e['role']):9s} phase={str(e['phase']):15s} action={str(e['action'])}"
         )
     print("=====================")
+
+
+def _opponent_leader_set(state, player: int, threat_dev_card_weight: float = 0.7) -> set[int]:
+    opponents = [p for p in range(len(state.public_vp)) if p != player]
+    if not opponents:
+        return set()
+    dev_counts = (state.dev_cards_hidden + state.dev_cards_bought_this_turn).sum(axis=1).astype(np.float32)
+    threats = state.public_vp.astype(np.float32) + float(threat_dev_card_weight) * dev_counts
+    top = float(np.max(threats[opponents]))
+    return set(p for p in opponents if float(threats[p]) == top)
+
+
+def _blocked_production_on_hex(state, hex_id: int, player: int) -> float:
+    blocked = 0.0
+    for v in state.topology.hex_to_vertices[int(hex_id)]:
+        if int(state.vertex_owner[v]) != player:
+            continue
+        b = int(state.vertex_building[v])
+        if b == int(Building.EMPTY):
+            continue
+        mult = 2.0 if b == int(Building.CITY) else 1.0
+        blocked += float(state.hex_pip_count[int(hex_id)]) * mult
+    return blocked
+
+
+def _record_robber_knight_event(
+    events: list[dict],
+    *,
+    step: int,
+    player: int,
+    action: Action,
+    state_before,
+    threat_dev_card_weight: float = 0.7,
+) -> None:
+    kind = action.kind
+    if kind not in {"PLAY_KNIGHT", "MOVE_ROBBER", "ROB_PLAYER"}:
+        return
+
+    rec = {
+        "step": int(step),
+        "player": int(player),
+        "kind": kind,
+    }
+
+    leaders = _opponent_leader_set(state_before, int(player), float(threat_dev_card_weight))
+    rec["leaders"] = sorted(int(x) for x in leaders)
+
+    if kind == "MOVE_ROBBER":
+        (hex_id,) = action.params
+        blocked_leader = float(sum(_blocked_production_on_hex(state_before, int(hex_id), p) for p in leaders))
+        blocked_self = float(_blocked_production_on_hex(state_before, int(hex_id), int(player)))
+        rec["blocked_leader"] = blocked_leader
+        rec["blocked_self"] = blocked_self
+        rec["block_leader"] = bool(blocked_leader > blocked_self)
+    elif kind == "ROB_PLAYER":
+        (target,) = action.params
+        rec["target"] = int(target)
+        rec["robbed_leader"] = bool(int(target) in leaders)
+
+    events.append(rec)
+
+
+def _print_robber_knight_summary(events: list[dict]) -> None:
+    print("\n=== Robber/Knight Summary ===")
+    if not events:
+        print("No robber/knight actions recorded.")
+        print("=============================")
+        return
+
+    by_player: dict[int, Counter] = defaultdict(Counter)
+    by_kind = Counter()
+    for e in events:
+        p = int(e["player"])
+        k = str(e["kind"])
+        by_kind[k] += 1
+        by_player[p][k] += 1
+        if k == "ROB_PLAYER":
+            if bool(e.get("robbed_leader", False)):
+                by_player[p]["ROB_LEADER"] += 1
+            else:
+                by_player[p]["ROB_NON_LEADER"] += 1
+        if k == "MOVE_ROBBER" and bool(e.get("block_leader", False)):
+            by_player[p]["MOVE_BLOCK_LEADER"] += 1
+
+    print(
+        "totals:",
+        f"PLAY_KNIGHT={int(by_kind.get('PLAY_KNIGHT', 0))}",
+        f"MOVE_ROBBER={int(by_kind.get('MOVE_ROBBER', 0))}",
+        f"ROB_PLAYER={int(by_kind.get('ROB_PLAYER', 0))}",
+    )
+    print("\nper_player:")
+    for p in range(4):
+        c = by_player.get(p, Counter())
+        rob_total = int(c.get("ROB_PLAYER", 0))
+        rob_leader = int(c.get("ROB_LEADER", 0))
+        rob_rate = (rob_leader / rob_total) if rob_total > 0 else 0.0
+        print(
+            f"  P{p}: knights={int(c.get('PLAY_KNIGHT', 0))} "
+            f"move_robber={int(c.get('MOVE_ROBBER', 0))} "
+            f"move_block_leader={int(c.get('MOVE_BLOCK_LEADER', 0))} "
+            f"rob_total={rob_total} rob_leader={rob_leader} rob_leader_rate={rob_rate:.3f}"
+        )
+
+    print("\nlast_robber_knight_events:")
+    for e in events[-12:]:
+        kind = str(e["kind"])
+        if kind == "ROB_PLAYER":
+            extra = f" target={int(e.get('target', -1))} robbed_leader={bool(e.get('robbed_leader', False))}"
+        elif kind == "MOVE_ROBBER":
+            extra = (
+                f" block_leader={bool(e.get('block_leader', False))}"
+                f" blocked_leader={float(e.get('blocked_leader', 0.0)):.2f}"
+                f" blocked_self={float(e.get('blocked_self', 0.0)):.2f}"
+            )
+        else:
+            extra = ""
+        print(f"  step={int(e['step']):04d} player={int(e['player'])} kind={kind}{extra}")
+    print("=============================")
+
+
+def _print_setup_shaping_event(*, step: int, player: int, action_id: int, state_before) -> None:
+    details = setup_settlement_shaping_details(state_before, int(action_id))
+    if details is None:
+        return
+    hits = details.get("rule_hits", [])
+    hits_txt = ",".join(str(x) for x in hits) if hits else "none"
+    print(
+        "  setup_shaping:",
+        f"vertex={int(details.get('vertex', -1))}",
+        f"hits={hits_txt}",
+        f"eligible={bool(details.get('eligible', False))}",
+        f"pips={float(details.get('total_pips', 0.0)):.2f}",
+        f"hexes={int(details.get('productive_hexes', 0))}",
+        f"diversity={int(details.get('diversity', 0))}",
+        f"has_combo={bool(details.get('has_combo', False))}",
+        f"has_complement_pair={bool(details.get('has_complement_pair', False))}",
+        f"pip_quality={float(details.get('pip_quality', 0.0)):.3f}",
+        f"combo_factor={float(details.get('combo_factor', 0.0)):.3f}",
+        f"(step={int(step)} player={int(player)})",
+    )
+
+
+def _print_engineered_summary(env: CatanEnv) -> None:
+    s = env.state
+    summary = engineered_feature_summary(s, current_player=int(s.current_player))
+    print("\n=== Engineered Feature Summary ===")
+    print(f"current_player={int(s.current_player)} phase={Phase(s.phase).name}")
+    for k, v in summary.items():
+        vals = ", ".join(f"{float(x):.3f}" for x in v)
+        print(f"{k}=[{vals}]")
+    print("==================================")
+
+
+def _print_dev_card_summary(env: CatanEnv) -> None:
+    s = env.state
+    labels = ["KNIGHT", "ROAD_BUILDING", "YEAR_OF_PLENTY", "MONOPOLY", "VP"]
+    print("\n=== Dev Card Summary ===")
+    for p in range(len(s.public_vp)):
+        held = (s.dev_cards_hidden[p] + s.dev_cards_bought_this_turn[p]).astype(int)
+        held_txt = ", ".join(f"{labels[i]}={int(held[i])}" for i in range(len(labels)))
+        print(
+            f"  P{p}: held[{held_txt}] "
+            f"played_knights={int(s.knights_played[p])} "
+            f"vp_cards_held={int(s.vp_cards_held[p])}"
+        )
+
+    # Non-knight dev plays are not tracked per-player historically.
+    # Show global played estimates by conservation.
+    estimated_played = np.asarray(INITIAL_DEV_DECK, dtype=np.int64) - s.dev_deck_composition - (
+        s.dev_cards_hidden + s.dev_cards_bought_this_turn
+    ).sum(axis=0)
+    est_txt = ", ".join(f"{labels[i]}={int(max(0, estimated_played[i]))}" for i in range(len(labels)))
+    print(f"  global_estimated_played[{est_txt}]")
+    print("========================")
 
 
 def _format_resources(resources: np.ndarray) -> str:
@@ -408,6 +600,17 @@ def main() -> None:
         default="0",
         help="Comma-separated player ids controlled by model (e.g. '0' or '0,1,2,3')",
     )
+    parser.add_argument(
+        "--sample-policy",
+        action="store_true",
+        help="Sample policy actions from masked probabilities instead of argmax.",
+    )
+    parser.add_argument(
+        "--policy-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for policy sampling/argmax probabilities (>0).",
+    )
     parser.add_argument("--max-main-actions-per-turn", type=int, default=10)
     parser.add_argument("--disable-player-trade", action="store_true")
     parser.add_argument("--trade-action-mode", choices=["guided", "full"], default="guided")
@@ -433,9 +636,25 @@ def main() -> None:
         action="store_true",
         help="With --show-final-inspect-board, include full vertex/edge topology tables.",
     )
+    parser.add_argument(
+        "--show-engineered-summary",
+        action="store_true",
+        help="Print planning-focused engineered feature top3 values from final state.",
+    )
+    parser.add_argument(
+        "--show-dev-card-summary",
+        action="store_true",
+        help="Print per-player dev-card holding and played summary in final state.",
+    )
+    parser.add_argument(
+        "--show-setup-shaping-events",
+        action="store_true",
+        help="Print per-setup-settlement shaping rule hits using training reward logic.",
+    )
     args = parser.parse_args()
 
     model_players = set(int(x) for x in args.model_players.split(",") if x != "")
+    policy_rng = np.random.default_rng(args.seed + 424242) if args.sample_policy else None
     env = CatanEnv(
         seed=args.seed,
         max_main_actions_per_turn=args.max_main_actions_per_turn,
@@ -454,6 +673,7 @@ def main() -> None:
 
     out_f = open(args.json_out, "w", encoding="utf-8") if args.json_out else None
     trade_events: list[dict] = []
+    robber_knight_events: list[dict] = []
     try:
         for step in range(1, args.max_steps + 1):
             if env.state.phase == Phase.GAME_OVER:
@@ -464,11 +684,19 @@ def main() -> None:
             role, bot = _agent_for_player(player, model_players, model, args.seed)
 
             if role == "policy":
-                action_id, top = _policy_choice_with_probs(model, obs, mask)
+                action_id, top = _policy_choice_with_probs(
+                    model,
+                    obs,
+                    mask,
+                    sample_policy=bool(args.sample_policy),
+                    policy_temperature=float(args.policy_temperature),
+                    rng=policy_rng,
+                )
             else:
                 action_id = int(bot.act(obs, mask))
                 top = []
             action = CATALOG.decode(action_id)
+            state_before = env.state.copy()
 
             print(
                 f"step={step:03d} player={player} role={role:9s} phase={phase:15s} "
@@ -476,6 +704,8 @@ def main() -> None:
             )
             if top:
                 _print_top_actions(top)
+            if args.show_setup_shaping_events:
+                _print_setup_shaping_event(step=step, player=player, action_id=action_id, state_before=state_before)
             _record_trade_event(
                 trade_events,
                 step=step,
@@ -483,6 +713,14 @@ def main() -> None:
                 role=role,
                 phase=phase,
                 action_id=action_id,
+            )
+            _record_robber_knight_event(
+                robber_knight_events,
+                step=step,
+                player=player,
+                action=action,
+                state_before=state_before,
+                threat_dev_card_weight=0.7,
             )
 
             result = env.step(action_id)
@@ -517,7 +755,12 @@ def main() -> None:
         print(f"public_vp={env.state.public_vp.tolist()}")
         print(f"actual_vp={env.state.actual_vp.tolist()}")
         print("===================")
+        if args.show_engineered_summary:
+            _print_engineered_summary(env)
+        if args.show_dev_card_summary:
+            _print_dev_card_summary(env)
         _print_trade_summary(trade_events)
+        _print_robber_knight_summary(robber_knight_events)
         if args.show_final_board:
             _print_final_board(env)
         if args.show_final_inspect_board:

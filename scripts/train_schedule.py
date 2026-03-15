@@ -17,7 +17,13 @@ from catan_rl.env import CatanEnv
 from catan_rl.eval import tournament
 from catan_rl.training.bc import collect_bc_dataset, pretrain_policy_with_bc
 from catan_rl.training.ppo import PPOConfig, PPOTrainer, PolicyValueNet, compute_gae
-from catan_rl.training.self_play import collect_rollout, save_checkpoint
+from catan_rl.training.self_play import (
+    anti_leader_robber_shaping,
+    collect_rollout,
+    save_checkpoint,
+    setup_settlement_shaping,
+    terminal_table_mean_shaping,
+)
 from catan_rl.training.wrappers import PolicyAgent
 
 
@@ -136,6 +142,13 @@ def _collect_rollout_opponent_mix(
     truncation_leader_reward: bool,
     reward_shaping_vp: float,
     reward_shaping_resource: float,
+    reward_shaping_robber_block_leader: float,
+    reward_shaping_rob_leader: float,
+    reward_shaping_rob_mistarget: float,
+    reward_shaping_play_knight: float,
+    reward_shaping_setup_settlement: float,
+    reward_shaping_terminal_table_mean: float,
+    threat_dev_card_weight: float,
     opponent_seat_count: int,
     heuristic_prob: float,
     random_prob: float,
@@ -159,12 +172,14 @@ def _collect_rollout_opponent_mix(
     )
     learner_seats = set(range(NUM_PLAYERS)) - opponent_seats
     last_learner_idx: int | None = None
+    last_learner_player: int | None = None
 
     while collected < steps:
         player = int(env.state.current_player)
         if player in learner_seats:
             prev_public_vp = int(env.state.public_vp[player])
             prev_resource_total = int(env.state.resource_total[player])
+            state_before = env.state.copy()
             action, logp, value = trainer.act(obs, mask)
             res = env.step(action)
             reward = float(res.reward)
@@ -172,8 +187,29 @@ def _collect_rollout_opponent_mix(
             delta_resources = int(env.state.resource_total[player]) - prev_resource_total
             reward += reward_shaping_vp * float(delta_vp)
             reward += reward_shaping_resource * float(delta_resources)
+            reward += anti_leader_robber_shaping(
+                state_before,
+                int(player),
+                int(action),
+                threat_dev_card_weight=float(threat_dev_card_weight),
+                robber_block_leader_coef=float(reward_shaping_robber_block_leader),
+                rob_leader_coef=float(reward_shaping_rob_leader),
+                rob_mistarget_coef=float(reward_shaping_rob_mistarget),
+                play_knight_coef=float(reward_shaping_play_knight),
+            )
+            reward += setup_settlement_shaping(
+                state_before,
+                int(action),
+                setup_settlement_coef=float(reward_shaping_setup_settlement),
+            )
 
             done = bool(res.done)
+            if done and int(env.state.winner) >= 0:
+                reward += terminal_table_mean_shaping(
+                    env.state,
+                    int(player),
+                    float(reward_shaping_terminal_table_mean),
+                )
             episode_steps += 1
             if not done and episode_steps >= max_episode_steps:
                 done = True
@@ -188,6 +224,7 @@ def _collect_rollout_opponent_mix(
             buf["dones"].append(float(done))
             buf["masks"].append(mask)
             last_learner_idx = len(buf["dones"]) - 1
+            last_learner_player = int(player)
             collected += 1
             if done:
                 obs, info = env.reset()
@@ -204,6 +241,7 @@ def _collect_rollout_opponent_mix(
                 )
                 learner_seats = set(range(NUM_PLAYERS)) - opponent_seats
                 last_learner_idx = None
+                last_learner_player = None
             else:
                 obs = res.obs
                 mask = res.info["action_mask"]
@@ -226,6 +264,12 @@ def _collect_rollout_opponent_mix(
                         buf["rewards"][last_learner_idx] += 1.0
                     else:
                         buf["rewards"][last_learner_idx] -= 1.0
+                    if last_learner_player is not None:
+                        buf["rewards"][last_learner_idx] += terminal_table_mean_shaping(
+                            env.state,
+                            int(last_learner_player),
+                            float(reward_shaping_terminal_table_mean),
+                        )
                 elif truncated and truncation_leader_reward:
                     buf["rewards"][last_learner_idx] += _truncation_reward_for_learner_seats(env, learner_seats)
 
@@ -244,6 +288,7 @@ def _collect_rollout_opponent_mix(
                 )
                 learner_seats = set(range(NUM_PLAYERS)) - opponent_seats
                 last_learner_idx = None
+                last_learner_player = None
             else:
                 obs = res.obs
                 mask = res.info["action_mask"]
@@ -279,6 +324,13 @@ def main() -> None:
     parser.add_argument("--disable-truncation-leader-reward", action="store_true")
     parser.add_argument("--reward-shaping-vp", type=float, default=0.01)
     parser.add_argument("--reward-shaping-resource", type=float, default=0.001)
+    parser.add_argument("--reward-shaping-robber-block-leader", type=float, default=0.0)
+    parser.add_argument("--reward-shaping-rob-leader", type=float, default=0.0)
+    parser.add_argument("--reward-shaping-rob-mistarget", type=float, default=0.0)
+    parser.add_argument("--reward-shaping-play-knight", type=float, default=0.0)
+    parser.add_argument("--reward-shaping-setup-settlement", type=float, default=0.0)
+    parser.add_argument("--reward-shaping-terminal-table-mean", type=float, default=0.0)
+    parser.add_argument("--threat-dev-card-weight", type=float, default=0.7)
     parser.add_argument("--max-main-actions-per-turn", type=int, default=12)
     parser.add_argument("--disable-player-trade", action="store_true")
     parser.add_argument("--trade-action-mode", choices=["guided", "full"], default="guided")
@@ -379,6 +431,13 @@ def main() -> None:
                 truncation_leader_reward=not args.disable_truncation_leader_reward,
                 reward_shaping_vp=args.reward_shaping_vp,
                 reward_shaping_resource=args.reward_shaping_resource,
+                reward_shaping_robber_block_leader=args.reward_shaping_robber_block_leader,
+                reward_shaping_rob_leader=args.reward_shaping_rob_leader,
+                reward_shaping_rob_mistarget=args.reward_shaping_rob_mistarget,
+                reward_shaping_play_knight=args.reward_shaping_play_knight,
+                reward_shaping_setup_settlement=args.reward_shaping_setup_settlement,
+                reward_shaping_terminal_table_mean=args.reward_shaping_terminal_table_mean,
+                threat_dev_card_weight=args.threat_dev_card_weight,
                 opponent_seat_count=args.opponent_seat_count,
                 heuristic_prob=args.mix_heuristic_prob,
                 random_prob=args.mix_random_prob,
@@ -395,6 +454,13 @@ def main() -> None:
                 truncation_leader_reward=not args.disable_truncation_leader_reward,
                 reward_shaping_vp=args.reward_shaping_vp,
                 reward_shaping_resource=args.reward_shaping_resource,
+                reward_shaping_robber_block_leader=args.reward_shaping_robber_block_leader,
+                reward_shaping_rob_leader=args.reward_shaping_rob_leader,
+                reward_shaping_rob_mistarget=args.reward_shaping_rob_mistarget,
+                reward_shaping_play_knight=args.reward_shaping_play_knight,
+                reward_shaping_setup_settlement=args.reward_shaping_setup_settlement,
+                reward_shaping_terminal_table_mean=args.reward_shaping_terminal_table_mean,
+                threat_dev_card_weight=args.threat_dev_card_weight,
             )
         train_stats = trainer.update(batch)
 
@@ -432,6 +498,13 @@ def main() -> None:
             "truncation_leader_reward": not args.disable_truncation_leader_reward,
             "reward_shaping_vp": args.reward_shaping_vp,
             "reward_shaping_resource": args.reward_shaping_resource,
+            "reward_shaping_robber_block_leader": args.reward_shaping_robber_block_leader,
+            "reward_shaping_rob_leader": args.reward_shaping_rob_leader,
+            "reward_shaping_rob_mistarget": args.reward_shaping_rob_mistarget,
+            "reward_shaping_play_knight": args.reward_shaping_play_knight,
+            "reward_shaping_setup_settlement": args.reward_shaping_setup_settlement,
+            "reward_shaping_terminal_table_mean": args.reward_shaping_terminal_table_mean,
+            "threat_dev_card_weight": args.threat_dev_card_weight,
             "max_main_actions_per_turn": args.max_main_actions_per_turn,
             "allow_player_trade": not args.disable_player_trade,
             "trade_action_mode": args.trade_action_mode,

@@ -10,15 +10,15 @@ set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"
 BASE_OUT="${BASE_OUT:-league_runs}"
-CYCLES="${CYCLES:-8}"
+CYCLES="${CYCLES:-12}"
 RESET_WEAKEST_FROM_CHAMP="${RESET_WEAKEST_FROM_CHAMP:-1}"
 SKIP_COMPLETED_BRANCHES="${SKIP_COMPLETED_BRANCHES:-1}"
 PARALLEL_JOBS="${PARALLEL_JOBS:-1}"
 
 # ---- Fill these before running ----
-CKPT_A="${CKPT_A:-enhm3_seed23107/checkpoints/policy_u20.pt}"
-CKPT_B="${CKPT_B:-enhm3_seed23103/checkpoints/policy_u30.pt}"
-CKPT_C="${CKPT_C:-enh2_seed22103/checkpoints/policy_u20.pt}"
+CKPT_A="${CKPT_A:-old_runs/cycle_5/branch_B/checkpoints/policy_u20.pt}"
+CKPT_B="${CKPT_B:-old_runs/cycle_7/branch_C/checkpoints/policy_u10.pt}"
+CKPT_C="${CKPT_C:-old_runs/cycle_21/branch_A/checkpoints/policy_u30.pt}"
 # -----------------------------------
 
 BRANCHES=("A" "B" "C")
@@ -40,6 +40,13 @@ PPO_ENT_COEF="${PPO_ENT_COEF:-0.02}"
 PPO_EPOCHS="${PPO_EPOCHS:-1}"
 REWARD_SHAPING_VP="${REWARD_SHAPING_VP:-0.05}"
 REWARD_SHAPING_RESOURCE="${REWARD_SHAPING_RESOURCE:-0.0}"
+REWARD_SHAPING_ROBBER_BLOCK_LEADER="${REWARD_SHAPING_ROBBER_BLOCK_LEADER:-0.0}"
+REWARD_SHAPING_ROB_LEADER="${REWARD_SHAPING_ROB_LEADER:-0.0}"
+REWARD_SHAPING_ROB_MISTARGET="${REWARD_SHAPING_ROB_MISTARGET:-0.0}"
+REWARD_SHAPING_PLAY_KNIGHT="${REWARD_SHAPING_PLAY_KNIGHT:-0.0}"
+REWARD_SHAPING_SETUP_SETTLEMENT="${REWARD_SHAPING_SETUP_SETTLEMENT:-0.0}"
+REWARD_SHAPING_TERMINAL_TABLE_MEAN="${REWARD_SHAPING_TERMINAL_TABLE_MEAN:-0.0}"
+THREAT_DEV_CARD_WEIGHT="${THREAT_DEV_CARD_WEIGHT:-0.7}"
 
 # Mixture defaults. We compute heuristic probability from the others.
 MIX_RANDOM="${MIX_RANDOM:-0.10}"
@@ -131,6 +138,13 @@ PY
       --seed "$seed" \
       --reward-shaping-vp "$REWARD_SHAPING_VP" \
       --reward-shaping-resource "$REWARD_SHAPING_RESOURCE" \
+      --reward-shaping-robber-block-leader "$REWARD_SHAPING_ROBBER_BLOCK_LEADER" \
+      --reward-shaping-rob-leader "$REWARD_SHAPING_ROB_LEADER" \
+      --reward-shaping-rob-mistarget "$REWARD_SHAPING_ROB_MISTARGET" \
+      --reward-shaping-play-knight "$REWARD_SHAPING_PLAY_KNIGHT" \
+      --reward-shaping-setup-settlement "$REWARD_SHAPING_SETUP_SETTLEMENT" \
+      --reward-shaping-terminal-table-mean "$REWARD_SHAPING_TERMINAL_TABLE_MEAN" \
+      --threat-dev-card-weight "$THREAT_DEV_CARD_WEIGHT" \
       --max-episode-steps "$MAX_EPISODE_STEPS" \
       --eval-max-steps "$EVAL_MAX_STEPS" \
       --max-main-actions-per-turn "$MAX_MAIN_ACTIONS" \

@@ -4,7 +4,7 @@ from catan_rl.encoding import encode_observation
 from catan_rl.state import new_game_state
 
 
-ENGINEERED_FEATURE_DIM = 75
+ENGINEERED_FEATURE_DIM = 87
 TRADE_BLOCK_DIM = 15
 
 
@@ -40,4 +40,4 @@ def test_trade_proposer_none_is_preserved():
 def test_observation_includes_compact_engineered_block():
     state = new_game_state(seed=11)
     obs = encode_observation(state, full_info=True)
-    assert obs.shape[0] == 1301
+    assert obs.shape[0] == 1313
