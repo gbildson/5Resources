@@ -1,6 +1,7 @@
 import numpy as np
 
-from catan_rl.constants import Building
+from catan_rl.actions import Action
+from catan_rl.constants import Building, Phase
 from catan_rl.env import CatanEnv
 
 
@@ -124,3 +125,27 @@ def test_longest_road_award_transfers_when_block_reduces_holder():
     env.state.vertex_building[mid_vertex] = Building.SETTLEMENT
     env._update_vp_and_achievements()
     assert env.state.has_longest_road[1] == 1
+
+
+def test_cannot_extend_road_through_opponent_settlement_vertex():
+    env = CatanEnv(seed=407)
+    env.reset(seed=407)
+
+    # Reconstruct the reported pattern:
+    # player 1 road reaches vertex 21 via edge 25 (18-21),
+    # but player 0 owns a settlement/city on vertex 21.
+    env.state.phase = Phase.MAIN
+    env.state.current_player = 1
+    env.state.resources[1, 0] = 1
+    env.state.resources[1, 1] = 1
+    env.state.resource_total[1] = 2
+    env.state.roads_left[1] = max(1, int(env.state.roads_left[1]))
+
+    env.state.edge_owner[25] = 1
+    env.state.edge_road[25] = 1
+
+    env.state.vertex_owner[21] = 0
+    env.state.vertex_building[21] = Building.SETTLEMENT
+
+    # edge 41 is (21-31); this should be blocked by opponent building on 21.
+    assert env._is_action_legal(Action("PLACE_ROAD", (41,))) is False

@@ -7,6 +7,8 @@ from dataclasses import dataclass
 import numpy as np
 
 from .actions import CATALOG, Action
+from .constants import NUM_PLAYERS, NUM_RESOURCES, Phase, RESOURCE_COSTS
+from .encoding import observation_slices
 
 
 END_TURN_ACTION_ID = CATALOG.encode(Action("END_TURN"))
@@ -239,3 +241,150 @@ class MetaStrategyHeuristicAgent(Agent):
         legal_actions = [CATALOG.decode(int(a_id)) for a_id in legal]
         strategy = self._pick_strategy(legal_actions)
         return self._agents[strategy].act(obs, mask)
+
+
+class TradeFriendlyAgent(Agent):
+    """Heuristic agent that preferentially makes and accepts plausible beneficial trades."""
+
+    def __init__(self, seed: int | None = None):
+        self.rng = np.random.default_rng(seed)
+        self._sl = observation_slices()
+
+    def _phase_id(self, obs: np.ndarray) -> int:
+        phase_oh = obs[self._sl["phase_onehot"]]
+        return int(np.argmax(phase_oh))
+
+    def _self_resources(self, obs: np.ndarray) -> np.ndarray:
+        return np.rint(np.clip(obs[self._sl["self_resources"]], 0.0, 1.0) * 20.0).astype(np.int64)
+
+    def _pieces_left(self, obs: np.ndarray) -> np.ndarray:
+        vals = obs[self._sl["pieces_left"]].reshape(NUM_PLAYERS, 3)
+        return np.rint(np.clip(vals[0], 0.0, 1.0) * 15.0).astype(np.int64)
+
+    def _build_need_profile(self, obs: np.ndarray) -> tuple[set[int], bool]:
+        res = self._self_resources(obs).astype(np.float32)
+        pieces = self._pieces_left(obs)
+        build_costs: list[np.ndarray] = []
+        if int(pieces[2]) > 0:
+            build_costs.append(np.asarray(RESOURCE_COSTS["road"], dtype=np.float32))
+        if int(pieces[0]) > 0:
+            build_costs.append(np.asarray(RESOURCE_COSTS["settlement"], dtype=np.float32))
+        if int(pieces[1]) > 0:
+            build_costs.append(np.asarray(RESOURCE_COSTS["city"], dtype=np.float32))
+        build_costs.append(np.asarray(RESOURCE_COSTS["dev"], dtype=np.float32))
+        needed: set[int] = set()
+        can_build_now = False
+        for cost in build_costs:
+            deficit = np.maximum(cost - res, 0.0)
+            miss = int(deficit.sum())
+            if miss == 0:
+                can_build_now = True
+            if miss <= 2:
+                for r in np.flatnonzero(deficit > 0):
+                    needed.add(int(r))
+        return needed, can_build_now
+
+    def _estimate_build_value(self, resources: np.ndarray) -> float:
+        score = 0.0
+        for key in ("road", "settlement", "city", "dev"):
+            cost = np.asarray(RESOURCE_COSTS[key], dtype=np.float32)
+            deficit = np.maximum(cost - resources.astype(np.float32), 0.0)
+            total_deficit = float(deficit.sum())
+            ready = 1.0 - min(total_deficit, 6.0) / 6.0
+            if key == "city":
+                w = 0.85
+            elif key == "dev":
+                w = 0.55
+            else:
+                w = 0.65
+            score += w * (ready + (1.0 if total_deficit <= 0.0 else 0.0))
+        score += float(np.clip(8.0 - float(resources.sum()), -3.0, 3.0)) * 0.03
+        return float(score)
+
+    def _score_accept(self, obs: np.ndarray) -> float:
+        trade = obs[self._sl["trade_offer_give_want"]]
+        give = np.rint(np.clip(trade[:NUM_RESOURCES], 0.0, 1.0) * 4.0).astype(np.int64)
+        want = np.rint(np.clip(trade[NUM_RESOURCES:], 0.0, 1.0) * 4.0).astype(np.int64)
+        before = self._self_resources(obs).astype(np.float32)
+        if np.any(before < want):
+            return -1.0
+        after = before - want.astype(np.float32) + give.astype(np.float32)
+        return float(np.clip(self._estimate_build_value(after) - self._estimate_build_value(before), -1.0, 1.0))
+
+    def _score_propose(self, obs: np.ndarray, action: Action) -> float:
+        give_r, give_n, want_r, want_n = (int(x) for x in action.params)
+        resources = self._self_resources(obs)
+        if resources[give_r] < give_n:
+            return -1e9
+        needed, can_build_now = self._build_need_profile(obs)
+        total = int(resources.sum())
+        near_discard = total > 7
+        score = 0.0
+        if want_r in needed:
+            score += 2.0
+        if give_r in needed:
+            score -= 1.5
+        if give_n == 2:
+            if near_discard:
+                score += 1.2
+            if give_r not in needed and resources[give_r] >= 3:
+                score += 0.8
+            else:
+                score -= 0.5
+        else:
+            score += 0.2
+        if can_build_now and not near_discard and give_n == 1:
+            score -= 0.8
+        score += 0.3 * float(want_n) / max(1.0, float(give_n))
+        return score
+
+    @staticmethod
+    def _base_action_score(kind: str) -> float:
+        if kind == "PLACE_CITY":
+            return 9.0
+        if kind == "PLACE_SETTLEMENT":
+            return 8.0
+        if kind == "BUY_DEV_CARD":
+            return 6.0
+        if kind == "PLAY_KNIGHT":
+            return 5.0
+        if kind == "PLACE_ROAD":
+            return 4.0
+        if kind == "ROLL_DICE":
+            return 3.0
+        if kind == "BANK_TRADE":
+            return 2.0
+        if kind == "END_TURN":
+            return 1.0
+        return 0.0
+
+    def act(self, obs: np.ndarray, mask: np.ndarray) -> int:
+        legal = np.flatnonzero(mask)
+        if legal.size == 0:
+            return END_TURN_ACTION_ID
+        if legal.size == 1:
+            return int(legal[0])
+        phase = self._phase_id(obs)
+        legal_actions = [(int(a_id), CATALOG.decode(int(a_id))) for a_id in legal]
+
+        if phase == int(Phase.TRADE_PROPOSED):
+            accept_score = self._score_accept(obs)
+            accept_id = next((a_id for a_id, action in legal_actions if action.kind == "ACCEPT_TRADE"), None)
+            reject_id = next((a_id for a_id, action in legal_actions if action.kind == "REJECT_TRADE"), None)
+            if accept_id is not None and accept_score >= 0.05:
+                return int(accept_id)
+            if reject_id is not None:
+                return int(reject_id)
+
+        scored_actions: list[tuple[int, float]] = []
+        for a_id, action in legal_actions:
+            if action.kind == "PROPOSE_TRADE":
+                score = self._score_propose(obs, action)
+            else:
+                score = self._base_action_score(action.kind)
+            scored_actions.append((int(a_id), float(score)))
+        if not scored_actions:
+            return int(self.rng.choice(legal))
+        best_score = max(score for _, score in scored_actions)
+        top = [a_id for a_id, score in scored_actions if abs(score - best_score) < 1e-6]
+        return int(self.rng.choice(top))

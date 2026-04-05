@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections import Counter, defaultdict
+from pathlib import Path
 from typing import Iterable
 
 import numpy as np
@@ -13,10 +14,26 @@ import torch
 from catan_rl.actions import CATALOG, Action
 from catan_rl.bots import HeuristicAgent, RandomLegalAgent
 from catan_rl.constants import Building, DevCard, INITIAL_DEV_DECK, Phase
-from catan_rl.encoding import engineered_feature_summary
+from catan_rl.encoding import engineered_feature_summary, trade_offer_readiness_deltas
 from catan_rl.env import CatanEnv
+from catan_rl.strategy_metrics import (
+    bank_trade_value,
+    init_dev_timing_tracker,
+    is_setup_settlement_phase,
+    record_dev_timing_step,
+    road_frontier_metrics,
+    strategic_evaluator_snapshot,
+    setup_choice_metrics,
+    summarize_dev_timing,
+    trade_accept_value,
+    trade_accept_immediate_build_gain,
+    trade_accept_should_avoid_proposer,
+    trade_offer_counterparty_value,
+    trade_offer_value,
+)
+from catan_rl.strategy_archetypes import archetype_definitions, infer_primary_strategy, infer_strategy_distribution
 from catan_rl.training.self_play import setup_settlement_shaping_details
-from catan_rl.training.ppo import PolicyValueNet
+from catan_rl.training.ppo import load_policy_value_net
 
 
 TERRAIN_NAMES = {
@@ -47,7 +64,7 @@ def _format_action(action: Action) -> str:
 
 
 def _policy_choice_with_probs(
-    model: PolicyValueNet,
+    model: torch.nn.Module,
     obs: np.ndarray,
     mask: np.ndarray,
     *,
@@ -75,6 +92,31 @@ def _policy_choice_with_probs(
     return action_id, top
 
 
+def _policy_strategy_mixture(model: torch.nn.Module, obs: np.ndarray) -> list[tuple[str, float]]:
+    if not hasattr(model, "predict_strategy"):
+        return []
+    defs = archetype_definitions()
+    keys = [d["key"] for d in defs]
+    with torch.no_grad():
+        obs_t = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
+        probs = model.predict_strategy(obs_t).squeeze(0).cpu().numpy()
+    top_ids = np.argsort(probs)[-3:][::-1]
+    out: list[tuple[str, float]] = []
+    for i in top_ids:
+        if i < 0 or i >= len(keys):
+            continue
+        out.append((keys[int(i)], float(probs[int(i)])))
+    return out
+
+
+def _print_policy_strategy_mixture(top: list[tuple[str, float]]) -> None:
+    if not top:
+        return
+    defs = {d["key"]: d["title"] for d in archetype_definitions()}
+    txt = " | ".join(f"{defs.get(k, k)}:{v:.3f}" for k, v in top)
+    print("  policy_strategy_top3:", txt)
+
+
 def _print_setup(env: CatanEnv) -> None:
     s = env.state
     print("=== Setup ===")
@@ -86,7 +128,7 @@ def _print_setup(env: CatanEnv) -> None:
     print("=============\n")
 
 
-def _agent_for_player(player: int, model_players: set[int], model: PolicyValueNet, seed: int):
+def _agent_for_player(player: int, model_players: set[int], model: torch.nn.Module, seed: int):
     if player in model_players:
         return ("policy", None)
     # Alternate simple opponents for a bit of variety.
@@ -113,21 +155,61 @@ def _record_trade_event(
     role: str,
     phase: str,
     action_id: int,
+    state_before,
 ) -> None:
     action = CATALOG.decode(action_id)
     if action.kind not in TRADE_KINDS:
         return
-    events.append(
-        {
-            "step": int(step),
-            "player": int(player),
-            "role": role,
-            "phase": phase,
-            "action_id": int(action_id),
-            "action": _format_action(action),
-            "kind": action.kind,
-        }
-    )
+    rec = {
+        "step": int(step),
+        "player": int(player),
+        "role": role,
+        "phase": phase,
+        "action_id": int(action_id),
+        "action": _format_action(action),
+        "kind": action.kind,
+    }
+
+    if action.kind == "PROPOSE_TRADE":
+        give_r, give_n, want_r, want_n = action.params
+        proposer_util = float(
+            trade_offer_value(state_before, int(player), int(give_r), int(give_n), int(want_r), int(want_n))
+        )
+        rec["proposer_utility"] = proposer_util
+        rec["best_responder_utility"] = float(
+            trade_offer_counterparty_value(state_before, int(player), int(give_r), int(give_n), int(want_r), int(want_n))
+        )
+    elif action.kind == "ACCEPT_TRADE":
+        accepter_util = float(trade_accept_value(state_before, int(player)))
+        rec["response_accept_utility"] = accepter_util
+        rec["immediate_unlock"] = bool(trade_accept_immediate_build_gain(state_before, int(player)))
+        rec["avoid_proposer"] = bool(trade_accept_should_avoid_proposer(state_before, int(player)))
+        proposer = int(state_before.trade_proposer)
+        offer_give = state_before.trade_offer_give.astype(np.int64)
+        offer_want = state_before.trade_offer_want.astype(np.int64)
+        proposer_offer_util = 0.0
+        if proposer >= 0 and int(np.sum(offer_give)) > 0 and int(np.sum(offer_want)) > 0:
+            give_r = int(np.argmax(offer_give))
+            want_r = int(np.argmax(offer_want))
+            give_n = int(offer_give[give_r])
+            want_n = int(offer_want[want_r])
+            proposer_offer_util = float(
+                trade_offer_value(state_before, proposer, give_r, give_n, want_r, want_n)
+            )
+        rec["accepter_utility"] = accepter_util
+        rec["proposer"] = proposer
+        rec["proposer_offer_utility"] = proposer_offer_util
+    elif action.kind == "REJECT_TRADE":
+        rec["response_accept_utility"] = float(trade_accept_value(state_before, int(player)))
+        rec["immediate_unlock"] = bool(trade_accept_immediate_build_gain(state_before, int(player)))
+        rec["avoid_proposer"] = bool(trade_accept_should_avoid_proposer(state_before, int(player)))
+    elif action.kind == "BANK_TRADE":
+        give_r, give_n, want_r = action.params
+        rec["bank_trade_utility"] = float(
+            bank_trade_value(state_before, int(player), int(give_r), int(give_n), int(want_r))
+        )
+
+    events.append(rec)
 
 
 def _print_trade_summary(events: list[dict]) -> None:
@@ -156,11 +238,73 @@ def _print_trade_summary(events: list[dict]) -> None:
             f"bank={int(c.get('BANK_TRADE', 0))}"
         )
 
+    proposer_utils = [float(e["proposer_utility"]) for e in events if "proposer_utility" in e]
+    best_responder_utils = [float(e["best_responder_utility"]) for e in events if "best_responder_utility" in e]
+    accepter_utils = [float(e["accepter_utility"]) for e in events if "accepter_utility" in e]
+    proposer_offer_utils_on_accept = [float(e["proposer_offer_utility"]) for e in events if "proposer_offer_utility" in e]
+    bank_utils = [float(e["bank_trade_utility"]) for e in events if "bank_trade_utility" in e]
+    response_events = [e for e in events if e["kind"] in {"ACCEPT_TRADE", "REJECT_TRADE"}]
+    positive_accept_util_count = sum(float(e.get("response_accept_utility", -1.0)) > 0.0 for e in response_events)
+    immediate_unlock_count = sum(bool(e.get("immediate_unlock", False)) for e in response_events)
+    avoid_proposer_count = sum(bool(e.get("avoid_proposer", False)) for e in response_events)
+    rejected_positive_util_count = sum(
+        e["kind"] == "REJECT_TRADE" and float(e.get("response_accept_utility", -1.0)) > 0.0 for e in response_events
+    )
+    rejected_unlock_count = sum(
+        e["kind"] == "REJECT_TRADE" and bool(e.get("immediate_unlock", False)) for e in response_events
+    )
+    if proposer_utils or best_responder_utils or accepter_utils or proposer_offer_utils_on_accept or bank_utils:
+        print("\nutility_estimates:")
+        if proposer_utils:
+            print(f"  propose_mean_proposer_utility={float(np.mean(proposer_utils)):.3f}")
+        if best_responder_utils:
+            print(f"  propose_mean_best_responder_utility={float(np.mean(best_responder_utils)):.3f}")
+        if accepter_utils:
+            print(f"  accept_mean_accepter_utility={float(np.mean(accepter_utils)):.3f}")
+        if proposer_offer_utils_on_accept:
+            print(
+                "  accept_mean_proposer_offer_utility="
+                f"{float(np.mean(proposer_offer_utils_on_accept)):.3f}"
+            )
+        if bank_utils:
+            print(f"  bank_trade_mean_utility={float(np.mean(bank_utils)):.3f}")
+    if response_events:
+        print("\nresponse_diagnostics:")
+        print(
+            f"  positive_accept_utility={positive_accept_util_count}/{len(response_events)} "
+            f"({positive_accept_util_count / max(1, len(response_events)):.3f})"
+        )
+        print(
+            f"  immediate_unlock_if_accept={immediate_unlock_count}/{len(response_events)} "
+            f"({immediate_unlock_count / max(1, len(response_events)):.3f})"
+        )
+        print(f"  reject_with_positive_accept_utility={rejected_positive_util_count}")
+        print(f"  reject_with_immediate_unlock={rejected_unlock_count}")
+        print(f"  response_events_avoid_proposer={avoid_proposer_count}")
+
     print("\nlast_trade_events:")
     for e in events[-12:]:
+        util_bits: list[str] = []
+        if "proposer_utility" in e:
+            util_bits.append(f"prop_u={float(e['proposer_utility']):+.3f}")
+        if "best_responder_utility" in e:
+            util_bits.append(f"best_resp_u={float(e['best_responder_utility']):+.3f}")
+        if "accepter_utility" in e:
+            util_bits.append(f"acc_u={float(e['accepter_utility']):+.3f}")
+        if "response_accept_utility" in e and "accepter_utility" not in e:
+            util_bits.append(f"acc_if_accept_u={float(e['response_accept_utility']):+.3f}")
+        if "proposer_offer_utility" in e:
+            util_bits.append(f"prop_offer_u={float(e['proposer_offer_utility']):+.3f}")
+        if "bank_trade_utility" in e:
+            util_bits.append(f"bank_u={float(e['bank_trade_utility']):+.3f}")
+        if "immediate_unlock" in e:
+            util_bits.append(f"unlock={bool(e['immediate_unlock'])}")
+        if "avoid_proposer" in e:
+            util_bits.append(f"avoid={bool(e['avoid_proposer'])}")
+        util_txt = (" " + " ".join(util_bits)) if util_bits else ""
         print(
             f"  step={int(e['step']):04d} player={int(e['player'])} "
-            f"role={str(e['role']):9s} phase={str(e['phase']):15s} action={str(e['action'])}"
+            f"role={str(e['role']):9s} phase={str(e['phase']):15s} action={str(e['action'])}{util_txt}"
         )
     print("=====================")
 
@@ -305,6 +449,99 @@ def _print_setup_shaping_event(*, step: int, player: int, action_id: int, state_
     )
 
 
+def _record_opening_event(events: list[dict], *, step: int, player: int, action: Action, state_before) -> dict | None:
+    if action.kind != "PLACE_SETTLEMENT" or not is_setup_settlement_phase(state_before):
+        return None
+    (vertex,) = action.params
+    metrics = setup_choice_metrics(state_before, int(player), int(vertex))
+    rec = {
+        "step": int(step),
+        "player": int(player),
+        "vertex": int(vertex),
+        **metrics,
+    }
+    events.append(rec)
+    return rec
+
+
+def _print_opening_summary(events: list[dict]) -> None:
+    print("\n=== Opening Quality Summary ===")
+    if not events:
+        print("No setup settlement events recorded.")
+        print("==============================")
+        return
+    by_player: dict[int, list[dict]] = defaultdict(list)
+    for e in events:
+        by_player[int(e["player"])].append(e)
+    for p in range(4):
+        ev = by_player.get(p, [])
+        if not ev:
+            print(f"  P{p}: no setup settlements recorded")
+            continue
+        mean_rank = float(np.mean([float(x["rank"]) for x in ev]))
+        mean_pct = float(np.mean([float(x["percentile"]) for x in ev]))
+        mean_gap = float(np.mean([float(x["score_gap_to_best"]) for x in ev]))
+        mean_pips = float(np.mean([float(x["total_pips"]) for x in ev]))
+        print(
+            f"  P{p}: count={len(ev)} mean_rank={mean_rank:.2f} "
+            f"mean_percentile={mean_pct:.3f} mean_gap_to_best={mean_gap:.3f} mean_pips={mean_pips:.2f}"
+        )
+    print("last_opening_events:")
+    for e in events[-8:]:
+        print(
+            f"  step={int(e['step']):04d} P{int(e['player'])} vertex={int(e['vertex'])} "
+            f"rank={int(e['rank'])}/{int(e['candidate_count'])} pct={float(e['percentile']):.3f} "
+            f"gap={float(e['score_gap_to_best']):.3f} pips={float(e['total_pips']):.2f}"
+        )
+    print("==============================")
+
+
+def _record_road_frontier_event(events: list[dict], *, step: int, player: int, phase: str, action: Action, state_before) -> dict | None:
+    if action.kind != "PLACE_ROAD":
+        return None
+    (edge,) = action.params
+    metrics = road_frontier_metrics(state_before, int(player), int(edge))
+    rec = {
+        "step": int(step),
+        "player": int(player),
+        "phase": str(phase),
+        "edge": int(edge),
+        **metrics,
+    }
+    events.append(rec)
+    return rec
+
+
+def _print_road_frontier_summary(events: list[dict]) -> None:
+    print("\n=== Road Frontier Summary ===")
+    if not events:
+        print("No road placement events recorded.")
+        print("=============================")
+        return
+    by_player: dict[int, list[dict]] = defaultdict(list)
+    for e in events:
+        by_player[int(e["player"])].append(e)
+    for p in range(4):
+        ev = by_player.get(p, [])
+        if not ev:
+            print(f"  P{p}: no roads placed")
+            continue
+        mean_gain = float(np.mean([float(x["connected_gain"]) for x in ev]))
+        useful = int(sum(1 for x in ev if int(x["connected_gain"]) > 0 or int(x["best_site_roads_delta"]) > 0))
+        mean_delta = float(np.mean([float(x["best_site_roads_delta"]) for x in ev]))
+        print(
+            f"  P{p}: roads={len(ev)} useful={useful} useful_rate={(useful / len(ev)):.3f} "
+            f"mean_connected_gain={mean_gain:.3f} mean_best_site_delta={mean_delta:.3f}"
+        )
+    print("last_road_events:")
+    for e in events[-10:]:
+        print(
+            f"  step={int(e['step']):04d} P{int(e['player'])} phase={str(e['phase'])} edge={int(e['edge'])} "
+            f"conn_gain={int(e['connected_gain'])} best_site_delta={int(e['best_site_roads_delta'])}"
+        )
+    print("=============================")
+
+
 def _print_engineered_summary(env: CatanEnv) -> None:
     s = env.state
     summary = engineered_feature_summary(s, current_player=int(s.current_player))
@@ -316,7 +553,43 @@ def _print_engineered_summary(env: CatanEnv) -> None:
     print("==================================")
 
 
-def _print_dev_card_summary(env: CatanEnv) -> None:
+def _print_strategy_metrics_summary(env: CatanEnv) -> None:
+    s = env.state
+    print("\n=== Strategy Metrics Summary ===")
+    for p in range(len(s.public_vp)):
+        snap = strategic_evaluator_snapshot(s, int(p))
+        race = snap["race_pressure"]
+        ready = snap["build_readiness"]
+        rbq = snap["robber_block_quality"]
+        print(
+            f"  P{p}: city_top_delta={float(snap['city_top_delta_score']):.3f} "
+            f"lr_pressure={float(race['longest_road_pressure']):.3f} "
+            f"army_pressure={float(race['largest_army_pressure']):.3f} "
+            f"robber_quality={float(rbq['quality_score']):.3f}"
+        )
+        print(
+            f"      readiness: road={float(ready['road']['estimated_turns']):.2f} "
+            f"settle={float(ready['settlement']['estimated_turns']):.2f} "
+            f"city={float(ready['city']['estimated_turns']):.2f} "
+            f"dev={float(ready['dev']['estimated_turns']):.2f}"
+        )
+    print("===============================")
+
+
+def _print_strategy_archetype_summary(env: CatanEnv) -> None:
+    s = env.state
+    defs = {d["key"]: d["title"] for d in archetype_definitions()}
+    print("\n=== Strategy Archetype Heuristic Labels ===")
+    for p in range(len(s.public_vp)):
+        dist = infer_strategy_distribution(s, int(p))
+        primary = infer_primary_strategy(s, int(p))
+        ranked = sorted(dist.items(), key=lambda kv: kv[1], reverse=True)[:3]
+        top_txt = " | ".join(f"{defs.get(k, k)}={float(v):.3f}" for k, v in ranked)
+        print(f"  P{p}: primary={defs.get(primary, primary)} ; top3={top_txt}")
+    print("===========================================")
+
+
+def _print_dev_card_summary(env: CatanEnv, dev_timing_tracker: dict | None = None) -> None:
     s = env.state
     labels = ["KNIGHT", "ROAD_BUILDING", "YEAR_OF_PLENTY", "MONOPOLY", "VP"]
     print("\n=== Dev Card Summary ===")
@@ -336,6 +609,31 @@ def _print_dev_card_summary(env: CatanEnv) -> None:
     ).sum(axis=0)
     est_txt = ", ".join(f"{labels[i]}={int(max(0, estimated_played[i]))}" for i in range(len(labels)))
     print(f"  global_estimated_played[{est_txt}]")
+    if dev_timing_tracker is not None:
+        timing = summarize_dev_timing(dev_timing_tracker)
+        print("\n  timing_per_player:")
+        for p in range(4):
+            by_card = timing["per_player"][p]
+            k = by_card["KNIGHT"]
+            y = by_card["YEAR_OF_PLENTY"]
+            m = by_card["MONOPOLY"]
+            print(
+                f"    P{p}: "
+                f"KN(opp={int(k['opportunity_turns'])},play={int(k['play_turns'])},first={int(k['first_play_turn'])},"
+                f"hold_before={int(k['held_turns_before_first_play'])},rate={float(k['play_rate_when_available']):.3f}) "
+                f"YOP(opp={int(y['opportunity_turns'])},play={int(y['play_turns'])},first={int(y['first_play_turn'])},"
+                f"rate={float(y['play_rate_when_available']):.3f}) "
+                f"MONO(opp={int(m['opportunity_turns'])},play={int(m['play_turns'])},first={int(m['first_play_turn'])},"
+                f"rate={float(m['play_rate_when_available']):.3f})"
+            )
+        t = timing["summary"]
+        print(
+            "  timing_summary:"
+            f" knight_rate={float(t['knight_mean_play_rate_when_available']):.3f}"
+            f" knight_hold_before_first={float(t['knight_mean_held_turns_before_first_play']):.3f}"
+            f" yop_rate={float(t['yop_mean_play_rate_when_available']):.3f}"
+            f" monopoly_rate={float(t['monopoly_mean_play_rate_when_available']):.3f}"
+        )
     print("========================")
 
 
@@ -398,6 +696,13 @@ def _print_final_board(env: CatanEnv) -> None:
         print(f"      cities={cities if cities else '[]'}")
         print(f"      roads={roads if roads else '[]'}")
         print(f"      ports={ports if ports else '[]'}")
+    lr_flags = [int(x) for x in s.has_longest_road.tolist()]
+    la_flags = [int(x) for x in s.has_largest_army.tolist()]
+    print(
+        "awards_summary: "
+        f"has_longest_road={lr_flags} "
+        f"has_largest_army={la_flags}"
+    )
     print("============================")
 
 
@@ -589,6 +894,68 @@ def _print_final_board_pycatan(env: CatanEnv) -> None:
     print("================================")
 
 
+def _checkpoint_meta(path: str) -> dict:
+    meta_path = Path(str(path) + ".meta.json")
+    if not meta_path.exists():
+        return {}
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _load_model_for_trace(
+    *,
+    checkpoint: str,
+    obs_dim: int,
+    action_dim: int,
+    model_arch: str | None,
+    model_hidden: int | None,
+    model_residual_blocks: int | None,
+):
+    meta = _checkpoint_meta(checkpoint)
+    arch = model_arch
+    hidden = model_hidden
+    blocks = model_residual_blocks
+
+    # If arch is provided but shape args are omitted, prefer checkpoint metadata.
+    if arch is not None:
+        if hidden is None and "model_hidden" in meta:
+            hidden = int(meta["model_hidden"])
+        if blocks is None and "model_residual_blocks" in meta:
+            blocks = int(meta["model_residual_blocks"])
+
+    # If user provided an incomplete manual config and metadata is unavailable, auto-infer.
+    if arch is not None and (hidden is None or blocks is None):
+        print(
+            "warning: partial model config provided (arch without hidden/blocks) and no usable metadata; "
+            "falling back to checkpoint auto-inference."
+        )
+        arch = None
+
+    try:
+        return load_policy_value_net(
+            checkpoint,
+            obs_dim=obs_dim,
+            action_dim=action_dim,
+            model_arch=arch,
+            hidden=256 if hidden is None else int(hidden),
+            residual_blocks=4 if blocks is None else int(blocks),
+        )
+    except Exception:
+        if arch is not None:
+            print("warning: provided model config did not match checkpoint; retrying with auto-inference.")
+            return load_policy_value_net(
+                checkpoint,
+                obs_dim=obs_dim,
+                action_dim=action_dim,
+                model_arch=None,
+                hidden=256,
+                residual_blocks=4,
+            )
+        raise
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True, help="Policy checkpoint path (.pt)")
@@ -611,6 +978,26 @@ def main() -> None:
         default=1.0,
         help="Temperature for policy sampling/argmax probabilities (>0).",
     )
+    parser.add_argument(
+        "--show-policy-strategy-mixture",
+        action="store_true",
+        help="For strategy-aware models, print top-3 predicted strategy mixture each policy step.",
+    )
+    parser.add_argument(
+        "--model-arch",
+        choices=[
+            "mlp",
+            "residual_mlp",
+            "phase_aware_residual_mlp",
+            "strategy_phase_aware_residual_mlp",
+            "graph_entity_hybrid",
+            "graph_entity_phase_aware_hybrid",
+            "graph_entity_only",
+        ],
+        default=None,
+    )
+    parser.add_argument("--model-hidden", type=int, default=None)
+    parser.add_argument("--model-residual-blocks", type=int, default=None)
     parser.add_argument("--max-main-actions-per-turn", type=int, default=10)
     parser.add_argument("--disable-player-trade", action="store_true")
     parser.add_argument("--trade-action-mode", choices=["guided", "full"], default="guided")
@@ -642,6 +1029,16 @@ def main() -> None:
         help="Print planning-focused engineered feature top3 values from final state.",
     )
     parser.add_argument(
+        "--show-strategy-metrics",
+        action="store_true",
+        help="Print reusable strategy-evaluator snapshot metrics in final state.",
+    )
+    parser.add_argument(
+        "--show-strategy-archetypes",
+        action="store_true",
+        help="Print heuristic strategy archetype labels derived from current state.",
+    )
+    parser.add_argument(
         "--show-dev-card-summary",
         action="store_true",
         help="Print per-player dev-card holding and played summary in final state.",
@@ -665,8 +1062,14 @@ def main() -> None:
     obs, info = env.reset(seed=args.seed)
     mask = info["action_mask"]
 
-    model = PolicyValueNet(obs_dim=obs.shape[0], action_dim=mask.shape[0])
-    model.load_state_dict(torch.load(args.checkpoint, map_location="cpu"))
+    model = _load_model_for_trace(
+        checkpoint=args.checkpoint,
+        obs_dim=obs.shape[0],
+        action_dim=mask.shape[0],
+        model_arch=args.model_arch,
+        model_hidden=args.model_hidden,
+        model_residual_blocks=args.model_residual_blocks,
+    )
     model.eval()
 
     _print_setup(env)
@@ -674,6 +1077,9 @@ def main() -> None:
     out_f = open(args.json_out, "w", encoding="utf-8") if args.json_out else None
     trade_events: list[dict] = []
     robber_knight_events: list[dict] = []
+    opening_events: list[dict] = []
+    road_frontier_events: list[dict] = []
+    dev_timing_tracker = init_dev_timing_tracker()
     try:
         for step in range(1, args.max_steps + 1):
             if env.state.phase == Phase.GAME_OVER:
@@ -692,20 +1098,50 @@ def main() -> None:
                     policy_temperature=float(args.policy_temperature),
                     rng=policy_rng,
                 )
+                strat_top = _policy_strategy_mixture(model, obs) if args.show_policy_strategy_mixture else []
             else:
                 action_id = int(bot.act(obs, mask))
                 top = []
+                strat_top = []
             action = CATALOG.decode(action_id)
             state_before = env.state.copy()
+            record_dev_timing_step(dev_timing_tracker, state_before, int(player), str(action.kind))
 
             print(
                 f"step={step:03d} player={player} role={role:9s} phase={phase:15s} "
                 f"legal={legal_count:3d} action={_format_action(action)}"
             )
+            if int(state_before.phase) == int(Phase.TRADE_PROPOSED):
+                d = trade_offer_readiness_deltas(state_before, int(player))
+                print(
+                    "  trade_accept_readiness_delta:"
+                    f" road={float(d[0]):+.1f}"
+                    f" settle={float(d[1]):+.1f}"
+                    f" city={float(d[2]):+.1f}"
+                    f" dev={float(d[3]):+.1f}"
+                    f" total={float(d[4]):+.2f}"
+                )
             if top:
                 _print_top_actions(top)
+            if strat_top:
+                _print_policy_strategy_mixture(strat_top)
             if args.show_setup_shaping_events:
                 _print_setup_shaping_event(step=step, player=player, action_id=action_id, state_before=state_before)
+            opening_event = _record_opening_event(
+                opening_events,
+                step=step,
+                player=player,
+                action=action,
+                state_before=state_before,
+            )
+            road_event = _record_road_frontier_event(
+                road_frontier_events,
+                step=step,
+                player=player,
+                phase=phase,
+                action=action,
+                state_before=state_before,
+            )
             _record_trade_event(
                 trade_events,
                 step=step,
@@ -713,6 +1149,7 @@ def main() -> None:
                 role=role,
                 phase=phase,
                 action_id=action_id,
+                state_before=state_before,
             )
             _record_robber_knight_event(
                 robber_knight_events,
@@ -736,10 +1173,13 @@ def main() -> None:
                             "action_id": action_id,
                             "action": _format_action(action),
                             "top5": top,
+                            "policy_strategy_top3": strat_top,
                             "reward": float(result.reward),
                             "winner": int(result.info.get("winner", -1)),
                             "public_vp": env.state.public_vp.tolist(),
                             "actual_vp": env.state.actual_vp.tolist(),
+                            "opening_event": opening_event,
+                            "road_frontier_event": road_event,
                         }
                     )
                     + "\n"
@@ -757,8 +1197,14 @@ def main() -> None:
         print("===================")
         if args.show_engineered_summary:
             _print_engineered_summary(env)
+        if args.show_strategy_metrics:
+            _print_strategy_metrics_summary(env)
+        if args.show_strategy_archetypes:
+            _print_strategy_archetype_summary(env)
         if args.show_dev_card_summary:
-            _print_dev_card_summary(env)
+            _print_dev_card_summary(env, dev_timing_tracker)
+        _print_opening_summary(opening_events)
+        _print_road_frontier_summary(road_frontier_events)
         _print_trade_summary(trade_events)
         _print_robber_knight_summary(robber_knight_events)
         if args.show_final_board:

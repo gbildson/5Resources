@@ -6,8 +6,49 @@ from collections import deque
 
 import numpy as np
 
-from .constants import Building, NUM_PLAYERS, NUM_RESOURCES, Phase, RESOURCE_COSTS
+from .constants import NUM_EDGES, NUM_HEXES, NUM_PORTS, NUM_VERTICES, Building, DevCard, NUM_PLAYERS, NUM_RESOURCES, Phase, RESOURCE_COSTS
 from .state import GameState
+
+
+def observation_slices() -> dict[str, slice]:
+    """Return named slices for major encoded observation blocks."""
+    i = 0
+    out: dict[str, slice] = {}
+
+    def _take(name: str, n: int) -> None:
+        nonlocal i
+        out[name] = slice(i, i + n)
+        i += n
+
+    _take("hex_terrain_onehot", NUM_HEXES * 6)
+    _take("hex_number", NUM_HEXES)
+    _take("hex_pip", NUM_HEXES)
+    _take("robber_onehot", NUM_HEXES)
+    _take("vertex_building_owner_onehot", NUM_VERTICES * (1 + 2 * NUM_PLAYERS))
+    _take("edge_owner_onehot", NUM_EDGES * (1 + NUM_PLAYERS))
+    _take("port_type_onehot", NUM_PORTS * 6)
+    _take("port_vertex_mask", NUM_VERTICES)
+    _take("self_resources", NUM_RESOURCES)
+    _take("opp_resource_totals", NUM_PLAYERS - 1)
+    _take("self_dev_hidden", NUM_RESOURCES)
+    _take("opp_knights_played", NUM_PLAYERS - 1)
+    _take("pieces_left", NUM_PLAYERS * 3)
+    _take("has_port", NUM_PLAYERS * 6)
+    _take("longest_road_length", NUM_PLAYERS)
+    _take("has_longest_road_and_largest_army", NUM_PLAYERS * 2)
+    _take("public_vp", NUM_PLAYERS)
+    _take("phase_onehot", 13)
+    _take("turn_features", 5)
+    _take("trade_offer_give_want", NUM_RESOURCES * 2)
+    _take("trade_proposer", 1)
+    _take("trade_responses", NUM_PLAYERS)
+    out["engineered_features"] = slice(i, None)
+    return out
+
+
+def phase_one_hot_slice() -> slice:
+    """Return the slice of the phase one-hot block in encoded observations."""
+    return observation_slices()["phase_onehot"]
 
 
 def _rotate_players(arr: np.ndarray, current_player: int) -> np.ndarray:
@@ -109,12 +150,115 @@ def _top3(values: list[float]) -> np.ndarray:
     return np.asarray(top, dtype=np.float32)
 
 
+def _readiness_flags_from_resources(state: GameState, player: int, resources: np.ndarray) -> np.ndarray:
+    """Binary readiness flags [road, settlement, city, dev] for a given resource vector."""
+    out = np.zeros(4, dtype=np.float32)
+    if int(state.roads_left[player]) > 0 and np.all(resources >= np.asarray(RESOURCE_COSTS["road"], dtype=np.int64)):
+        out[0] = 1.0
+    if int(state.settlements_left[player]) > 0 and np.all(
+        resources >= np.asarray(RESOURCE_COSTS["settlement"], dtype=np.int64)
+    ):
+        out[1] = 1.0
+    if int(state.cities_left[player]) > 0 and np.all(resources >= np.asarray(RESOURCE_COSTS["city"], dtype=np.int64)):
+        out[2] = 1.0
+    if int(state.dev_deck_remaining) > 0 and np.all(resources >= np.asarray(RESOURCE_COSTS["dev"], dtype=np.int64)):
+        out[3] = 1.0
+    return out
+
+
+def trade_offer_readiness_deltas(state: GameState, player: int) -> np.ndarray:
+    """Return signed readiness deltas for accepting current offer: [road, settlement, city, dev, total]."""
+    deltas = np.zeros(5, dtype=np.float32)
+    if int(state.phase) != int(Phase.TRADE_PROPOSED):
+        return deltas
+    proposer = int(state.trade_proposer)
+    if proposer < 0 or proposer == int(player):
+        return deltas
+
+    before_res = np.asarray(state.resources[int(player)], dtype=np.int64)
+    after_res = before_res + np.asarray(state.trade_offer_give, dtype=np.int64) - np.asarray(state.trade_offer_want, dtype=np.int64)
+    after_res = np.maximum(after_res, 0)
+    before_ready = _readiness_flags_from_resources(state, int(player), before_res)
+    after_ready = _readiness_flags_from_resources(state, int(player), after_res)
+    delta = after_ready - before_ready
+    deltas[0:4] = np.clip(delta, -1.0, 1.0)
+    deltas[4] = float(np.clip((after_ready.sum() - before_ready.sum()) / 4.0, -1.0, 1.0))
+    return deltas
+
+
+def _port_conversion_readiness(state: GameState, player: int) -> float:
+    """Estimate how ready current hand+ports are for meaningful card conversion."""
+    res = np.asarray(state.resources[int(player)], dtype=np.float32)
+    has_generic_port = int(state.has_port[int(player), 0]) == 1
+
+    # Expected conversion capacity from current hand under owned rates.
+    conv_units = 0.0
+    for r in range(NUM_RESOURCES):
+        has_specific = int(state.has_port[int(player), r + 1]) == 1
+        rate = 2.0 if has_specific else (3.0 if has_generic_port else 4.0)
+        conv_units += float(res[r] / rate)
+    conv_score = float(np.clip(conv_units / 3.0, 0.0, 1.0))
+
+    # How close we are to any actionable build; conversion is most valuable near thresholds.
+    deficits: list[float] = []
+    if int(state.roads_left[player]) > 0:
+        deficits.append(float(np.maximum(np.asarray(RESOURCE_COSTS["road"], dtype=np.float32) - res, 0.0).sum()))
+    if int(state.settlements_left[player]) > 0:
+        deficits.append(float(np.maximum(np.asarray(RESOURCE_COSTS["settlement"], dtype=np.float32) - res, 0.0).sum()))
+    if int(state.cities_left[player]) > 0:
+        deficits.append(float(np.maximum(np.asarray(RESOURCE_COSTS["city"], dtype=np.float32) - res, 0.0).sum()))
+    if int(state.dev_deck_remaining) > 0:
+        deficits.append(float(np.maximum(np.asarray(RESOURCE_COSTS["dev"], dtype=np.float32) - res, 0.0).sum()))
+    if deficits:
+        nearest_action = 1.0 - min(float(min(deficits)), 6.0) / 6.0
+    else:
+        nearest_action = 0.0
+
+    return float(np.clip(0.65 * conv_score + 0.35 * nearest_action, 0.0, 1.0))
+
+
 def _setup_settlement_score(
     state: GameState,
     vertex: int,
     self_prod: np.ndarray,
     global_pips: np.ndarray,
 ) -> float:
+    def _port_proximity_bonus(candidate: int, vec: np.ndarray) -> float:
+        # Small bonus for useful nearby ports; one-road-away is weighted above on-port.
+        inf = 10_000
+        dist = np.full(len(state.vertex_owner), inf, dtype=np.int32)
+        dist[int(candidate)] = 0
+        dq: deque[int] = deque([int(candidate)])
+        while dq:
+            v = int(dq.popleft())
+            d = int(dist[v])
+            if d >= 2:
+                continue
+            for n in state.topology.vertex_to_vertices[v]:
+                if n < 0:
+                    continue
+                ni = int(n)
+                if d + 1 < int(dist[ni]):
+                    dist[ni] = d + 1
+                    dq.append(ni)
+
+        best = 0.0
+        for p in range(len(state.port_type)):
+            a = int(state.port_vertices[p, 0])
+            b = int(state.port_vertices[p, 1])
+            d = min(int(dist[a]), int(dist[b]))
+            if d > 2:
+                continue
+            port_t = int(state.port_type[p])
+            if port_t == 0:
+                desirability = 0.45
+            else:
+                own = float(vec[port_t - 1])
+                desirability = 0.35 + 0.35 * min(own, 8.0) / 8.0
+            dist_w = 0.35 if d == 0 else (1.0 if d == 1 else 0.55)
+            best = max(best, desirability * dist_w)
+        return 0.45 * best
+
     vec = _vertex_resource_pips(state, vertex, robber_aware=False)
     pips_total = float(vec.sum())
     diversity = float(np.count_nonzero(vec > 0))
@@ -124,7 +268,22 @@ def _setup_settlement_score(
     missing_mask = (self_prod <= 1.0).astype(np.float32)
     complement = float((vec * missing_mask).sum())
     scarcity = float(np.sum(vec / np.maximum(1.0, global_pips)))
-    return pips_total + 0.7 * diversity + 0.25 * (ows_synergy + road_synergy) + 0.08 * weighted + 0.15 * complement + 2.5 * scarcity
+    wheat_bonus = 0.35 * float(vec[3])
+    if float(self_prod[3]) <= 1.0:
+        wheat_bonus += 0.55 * float(vec[3])
+    wheat_penalty = 1.20 if float(vec[3]) <= 0.0 else 0.0
+    port_bonus = _port_proximity_bonus(vertex, vec)
+    return (
+        pips_total
+        + 0.7 * diversity
+        + 0.25 * (ows_synergy + road_synergy)
+        + 0.08 * weighted
+        + 0.15 * complement
+        + 2.5 * scarcity
+        + wheat_bonus
+        - wheat_penalty
+        + port_bonus
+    )
 
 
 def _frontier_costs(state: GameState, player: int) -> np.ndarray:
@@ -251,6 +410,7 @@ def _compute_engineered_features(state: GameState, current_player: int) -> np.nd
         has_specific = int(s.has_port[cp, r + 1]) == 1
         rate = 2 if has_specific else (3 if has_generic_port else 4)
         out.append((rate - 2.0) / 2.0)
+    out.append(_port_conversion_readiness(s, cp))
 
     # Pip-weighted production potential by player/resource (robber-aware).
     prod = np.zeros((NUM_PLAYERS, NUM_RESOURCES), dtype=np.float32)
@@ -277,6 +437,7 @@ def _compute_engineered_features(state: GameState, current_player: int) -> np.nd
     out.extend((np.clip(prod_total_rot / 60.0, 0.0, 1.0)).tolist())  # all-player opportunity totals
 
     totals_rot = _rotate_players(s.resource_total, cp)
+    public_vp_rot = _rotate_players(s.public_vp, cp)
     out.extend((np.clip(totals_rot / 20.0, 0.0, 1.0)).astype(np.float32).tolist())  # compact visible-card proxy
     out.extend((totals_rot > 7).astype(np.float32).tolist())  # discard pressure flags
 
@@ -300,8 +461,13 @@ def _compute_engineered_features(state: GameState, current_player: int) -> np.nd
         mult = 2.0 if int(s.vertex_building[v]) == int(Building.CITY) else 1.0
         blocked_prod[owner] += float(s.hex_pip_count[rob_hex]) * mult
     blocked_prod_rot = _rotate_players(blocked_prod, cp)
-    out.extend(np.clip(blocked_prod_rot[1:] / 20.0, 0.0, 1.0).astype(np.float32).tolist())  # 3
-    out.extend(np.clip(totals_rot[1:] / 20.0, 0.0, 1.0).astype(np.float32).tolist())  # 3
+    blocked_opp_norm = np.clip(blocked_prod_rot[1:] / 20.0, 0.0, 1.0).astype(np.float32)
+    cards_opp_norm = np.clip(totals_rot[1:] / 20.0, 0.0, 1.0).astype(np.float32)
+    threat_opp_norm = np.clip(public_vp_rot[1:] / 10.0, 0.0, 1.0).astype(np.float32)
+    robber_target_value = np.clip(0.50 * blocked_opp_norm + 0.30 * cards_opp_norm + 0.20 * threat_opp_norm, 0.0, 1.0)
+    out.extend(blocked_opp_norm.tolist())  # 3
+    out.extend(cards_opp_norm.tolist())  # 3
+    out.extend(robber_target_value.astype(np.float32).tolist())  # 3
 
     # Expansion race: board opportunities by player (ignoring costs).
     settle_potential = np.zeros(NUM_PLAYERS, dtype=np.float32)
@@ -331,15 +497,84 @@ def _compute_engineered_features(state: GameState, current_player: int) -> np.nd
     opp_trade_activity = np.clip(opp_offer / 10.0, 0.0, 1.0)
     out.extend(opp_accept_ratio.astype(np.float32).tolist())  # 3
     out.extend(opp_trade_activity.astype(np.float32).tolist())  # 3
+    out.extend(trade_offer_readiness_deltas(s, cp).astype(np.float32).tolist())  # 5
 
-    public_vp_rot = _rotate_players(s.public_vp, cp)
     self_vp = float(public_vp_rot[0])
     out.extend((np.clip((public_vp_rot[1:] - self_vp) / 10.0, -1.0, 1.0)).astype(np.float32).tolist())
+    self_prod = _self_production_profile(s, cp)
+
+    # Compact race/threat/tempo proxies for city/dev/settlement prioritization.
+    self_kn = float(kn_rot[0])
+    best_opp_kn = float(np.max(kn_rot[1:])) if len(kn_rot) > 1 else 0.0
+    army_race_margin_best_opp = float(np.clip((self_kn - best_opp_kn) / 6.0, -1.0, 1.0))
+    self_has_largest_army = 1.0 if int(s.has_largest_army[cp]) == 1 else 0.0
+    if self_has_largest_army > 0.5:
+        # Positive when we need to spend effort to defend existing army edge.
+        army_lock_pressure = float(np.clip((best_opp_kn + 1.0 - self_kn) / 3.0, 0.0, 1.0))
+    else:
+        # Positive when we are close enough to contest / lock largest army soon.
+        to_threshold = max(0.0, 3.0 - self_kn) / 3.0
+        race_gap = max(0.0, best_opp_kn - self_kn) / 3.0
+        army_lock_pressure = float(np.clip(0.65 * to_threshold + 0.35 * race_gap, 0.0, 1.0))
+    public_lead_pressure = float(np.clip((self_vp - float(np.max(public_vp_rot[1:]))) / 5.0, -1.0, 1.0))
+    self_total_cards = float(totals_rot[0])
+    robber_exposure_proxy = float(
+        np.clip(
+            0.55 * max(0.0, public_lead_pressure)
+            + 0.35 * np.clip(self_total_cards / 12.0, 0.0, 1.0)
+            + 0.10 * (1.0 if self_total_cards > 7.0 else 0.0),
+            0.0,
+            1.0,
+        )
+    )
+    self_blocked_prod = float(np.clip(blocked_prod_rot[0] / 20.0, 0.0, 1.0))
+    best_city_delta = 0.0
+    for v in range(len(s.vertex_owner)):
+        if int(s.vertex_owner[v]) != cp or int(s.vertex_building[v]) != int(Building.SETTLEMENT):
+            continue
+        best_city_delta = max(best_city_delta, float(_vertex_resource_pips(s, v, robber_aware=True).sum()) / 15.0)
+    best_connected_settle = 0.0
+    for v in range(len(s.vertex_owner)):
+        if not _is_distance_rule_open(s, v):
+            continue
+        if not any(e >= 0 and int(s.edge_owner[int(e)]) == cp for e in s.topology.vertex_to_edges[v]):
+            continue
+        vec = _vertex_resource_pips(s, v, robber_aware=True)
+        q = float(vec.sum()) + 0.7 * float(np.count_nonzero(vec > 0))
+        q += 0.2 * float((vec * (self_prod <= 1.0).astype(np.float32)).sum())
+        best_connected_settle = max(best_connected_settle, float(np.clip((q + 4.0) / 12.0, 0.0, 1.0)))
+    city_tempo_proxy = float(np.clip(best_city_delta - best_connected_settle, -1.0, 1.0))
+    dev_deficit = int(np.maximum(np.asarray(RESOURCE_COSTS["dev"], dtype=np.int64) - self_res, 0).sum())
+    dev_afford_progress = 1.0 - min(dev_deficit, 6) / 6.0
+    ows_strength = float(min(self_prod[2], self_prod[3], self_prod[4]) / 8.0)
+    dev_synergy_proxy = float(np.clip(0.6 * np.clip(ows_strength, 0.0, 1.0) + 0.4 * dev_afford_progress, 0.0, 1.0))
+    knight_stock = float(np.clip(float(s.dev_cards_hidden[cp, int(DevCard.KNIGHT)]) / 3.0, 0.0, 1.0))
+    dev_timing_pressure = float(
+        np.clip(
+            0.35 * army_lock_pressure
+            + 0.25 * self_blocked_prod
+            + 0.20 * np.clip(ows_strength, 0.0, 1.0)
+            + 0.10 * dev_afford_progress
+            + 0.10 * knight_stock,
+            0.0,
+            1.0,
+        )
+    )
+    out.extend(
+        [
+            army_race_margin_best_opp,
+            army_lock_pressure,
+            public_lead_pressure,
+            robber_exposure_proxy,
+            city_tempo_proxy,
+            dev_synergy_proxy,
+            dev_timing_pressure,
+        ]
+    )
 
     # Phase-aware tactical planning helpers (top-3 summaries).
     is_setup_settlement = 1.0 if int(s.phase) == int(Phase.SETUP_SETTLEMENT) else 0.0
     is_main = 1.0 if int(s.phase) == int(Phase.MAIN) else 0.0
-    self_prod = _self_production_profile(s, cp)
     global_pips = _global_resource_pips(s)
 
     setup_scores: list[float] = []
@@ -390,16 +625,36 @@ def engineered_feature_summary(state: GameState, current_player: int | None = No
     """Return a compact summary of the newest planning-oriented engineered features.
 
     The summary is extracted from the tail of the engineered feature vector:
-    [setup_top3, main_top3, city_delta_top3, road_gain_top3].
+    [race_threat_tempo_7, setup_top3, main_top3, city_delta_top3, road_gain_top3].
     """
     cp = state.current_player if current_player is None else int(current_player)
     feat = _compute_engineered_features(state, cp)
     tail = feat[-12:]
+    race_threat_tempo = feat[-19:-12]
+    trade_delta = trade_offer_readiness_deltas(state, cp)
+    blocked_prod = np.zeros(NUM_PLAYERS, dtype=np.float32)
+    rob_hex = int(state.robber_hex)
+    for v in state.topology.hex_to_vertices[rob_hex]:
+        owner = int(state.vertex_owner[v])
+        if owner < 0:
+            continue
+        mult = 2.0 if int(state.vertex_building[v]) == int(Building.CITY) else 1.0
+        blocked_prod[owner] += float(state.hex_pip_count[rob_hex]) * mult
+    blocked_opp_norm = np.clip(_rotate_players(blocked_prod, cp)[1:] / 20.0, 0.0, 1.0).astype(np.float32)
+    cards_opp_norm = np.clip(_rotate_players(state.resource_total, cp)[1:] / 20.0, 0.0, 1.0).astype(np.float32)
+    threat_opp_norm = np.clip(_rotate_players(state.public_vp, cp)[1:] / 10.0, 0.0, 1.0).astype(np.float32)
+    robber_target_value = np.clip(0.50 * blocked_opp_norm + 0.30 * cards_opp_norm + 0.20 * threat_opp_norm, 0.0, 1.0)
     return {
+        "race_threat_tempo_proxy_7": race_threat_tempo.astype(np.float32).tolist(),
+        "race_threat_tempo_proxy_6": race_threat_tempo[:6].astype(np.float32).tolist(),
+        "dev_timing_pressure": [float(race_threat_tempo[6])],
+        "port_conversion_readiness": [float(_port_conversion_readiness(state, cp))],
+        "robber_target_value_opp3": robber_target_value.astype(np.float32).tolist(),
         "setup_settlement_quality_top3": tail[0:3].astype(np.float32).tolist(),
         "main_settlement_opportunity_top3": tail[3:6].astype(np.float32).tolist(),
         "city_delta_top3": tail[6:9].astype(np.float32).tolist(),
         "road_opportunity_gain_top3": tail[9:12].astype(np.float32).tolist(),
+        "trade_accept_readiness_delta_road_settle_city_dev_total": trade_delta.astype(np.float32).tolist(),
     }
 
 

@@ -1,0 +1,17 @@
+python -u scripts/train_schedule.py \
+  --model-arch phase_aware_residual_mlp \
+  --model-hidden 512 \
+  --model-residual-blocks 4 \
+  --ppo-lr 0.00003 \
+  --ppo-ent-coef 0.02 \
+  --ppo-epochs 1 \
+  --ppo-aux-coef 0.02 \
+  --rollout-steps 1024 \
+  --total-updates 40 \
+  --report-every 10 \
+  --games-per-seat 20 \
+  --max-episode-steps 600 \
+  --eval-max-steps 2200 \
+  --trade-action-mode guided \
+  --max-player-trade-proposals-per-turn 1 \
+  --out-dir artifacts_phase_aux_v1

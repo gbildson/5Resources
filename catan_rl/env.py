@@ -238,6 +238,26 @@ class CatanEnv:
                 return False
             if s.resources[p, give_r] < give_n:
                 return False
+            # Public-info optimistic feasibility filter (no private-hand leakage):
+            # keep offers that at least one responder is plausibly able to satisfy.
+            any_plausible_responder = False
+            for q in range(NUM_PLAYERS):
+                if q == p:
+                    continue
+                total_cards = int(s.resource_total[q])
+                if total_cards < want_n:
+                    continue
+                recent_gain_r = float(s.public_recent_gain[q, int(want_r)])
+                recent_spend_r = float(s.public_recent_spend[q, int(want_r)])
+                # Optimistic representative estimate of likely possession for wanted resource.
+                likely_have_want = (recent_gain_r - 0.50 * recent_spend_r) >= 0.15
+                # If hand is moderately large, allow exploratory proposals for the wanted type.
+                hand_overflow_hint = total_cards >= int(want_n + 2)
+                if likely_have_want or hand_overflow_hint:
+                    any_plausible_responder = True
+                    break
+            if not any_plausible_responder:
+                return False
             if self.trade_action_mode == "full":
                 return True
             return self._is_guided_trade_offer_legal(
@@ -254,7 +274,16 @@ class CatanEnv:
             if s.phase != Phase.TRADE_PROPOSED:
                 return False
             # Any non-proposer responder can answer while pending.
-            return s.trade_proposer >= 0 and p != s.trade_proposer and s.trade_responses[p] == 0
+            if not (s.trade_proposer >= 0 and p != s.trade_proposer and s.trade_responses[p] == 0):
+                return False
+            if action.kind == "ACCEPT_TRADE":
+                proposer = int(s.trade_proposer)
+                # Accept is legal only when the pending offer can execute immediately.
+                if not np.all(s.resources[proposer] >= s.trade_offer_give):
+                    return False
+                if not np.all(s.resources[p] >= s.trade_offer_want):
+                    return False
+            return True
 
         if action.kind == "BANK_TRADE":
             if s.phase != Phase.MAIN:
@@ -284,18 +313,20 @@ class CatanEnv:
         if setup:
             sv = s.setup_settlement_vertex
             return sv in (u, v)
-        # Connected to existing road or own building endpoint.
-        if (s.vertex_owner[u] == player and s.vertex_building[u] != Building.EMPTY) or (
-            s.vertex_owner[v] == player and s.vertex_building[v] != Building.EMPTY
-        ):
-            return True
-        for edge in s.topology.vertex_to_edges[u]:
-            if edge >= 0 and s.edge_owner[edge] == player:
+        # Connected to existing road or own building endpoint, with blocking:
+        # an opponent settlement/city on a vertex blocks road continuation
+        # through that vertex.
+        def _endpoint_connects(vertex: int) -> bool:
+            if s.vertex_owner[vertex] == player and s.vertex_building[vertex] != Building.EMPTY:
                 return True
-        for edge in s.topology.vertex_to_edges[v]:
-            if edge >= 0 and s.edge_owner[edge] == player:
-                return True
-        return False
+            if s.vertex_building[vertex] != Building.EMPTY and s.vertex_owner[vertex] != player:
+                return False
+            for edge in s.topology.vertex_to_edges[vertex]:
+                if edge >= 0 and s.edge_owner[edge] == player:
+                    return True
+            return False
+
+        return _endpoint_connects(int(u)) or _endpoint_connects(int(v))
 
     def _apply_action(self, player: int, action: Action) -> None:
         s = self.state
@@ -343,7 +374,12 @@ class CatanEnv:
             s.has_rolled = True
             if d == 7:
                 self._discard_roller = int(s.current_player)
-                self._discard_remaining[:] = (s.resource_total // 2).astype(np.int64)
+                # Catan rule: only players with more than 7 cards discard half.
+                self._discard_remaining[:] = np.where(
+                    s.resource_total > 7,
+                    s.resource_total // 2,
+                    0,
+                ).astype(np.int64)
                 s.must_discard[:] = (self._discard_remaining > 0).astype(np.int64)
                 if s.must_discard.any():
                     s.phase = Phase.DISCARD
@@ -698,8 +734,9 @@ class CatanEnv:
         near_discard = total_resources > 7
         needed_resources, can_build_now = self._trade_need_profile(player)
 
-        # If we can already execute a build and are not at discard risk, prefer building over player trades.
-        if can_build_now and not near_discard:
+        # If we can already execute a build and are not at discard risk, be conservative with 1-for-1.
+        # Keep room for selective 2-for-1 overflow/smoothing offers.
+        if can_build_now and not near_discard and give_n == 1:
             return False
 
         # Only ask for near-term useful resources, except allow ore/wheat conversion under discard pressure.
@@ -712,9 +749,17 @@ class CatanEnv:
             return False
 
         if give_n == 2:
-            # 2-for-1 is mainly useful as overflow control; otherwise require clear surplus.
-            if not near_discard and int(self.state.resources[player, give_r]) < 4:
-                return False
+            have_give = int(self.state.resources[player, give_r])
+            # 2-for-1 is often used to offload redundant cards. Allow more frequently than before.
+            if near_discard:
+                return True
+            # Classic "redundant -> needed" conversion.
+            if give_r not in needed_resources and want_r in needed_resources and have_give >= 3:
+                return True
+            # High-surplus dump even when need profile is noisy.
+            if have_give >= 5:
+                return True
+            return False
         elif give_n != 1:
             return False
 

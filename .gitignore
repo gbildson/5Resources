@@ -5,3 +5,5 @@ logs/
 __pycache__/
 *.pyc
 *.pyo
+bb
+phase_aware_v*
