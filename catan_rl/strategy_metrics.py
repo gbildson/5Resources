@@ -621,31 +621,44 @@ def trade_accept_immediate_build_gain(state: GameState, responder: int) -> bool:
     return False
 
 
+def _coerce_trade_vectors(*offer_args) -> tuple[np.ndarray, np.ndarray]:
+    if len(offer_args) == 2:
+        give = np.asarray(offer_args[0], dtype=np.float32)
+        want = np.asarray(offer_args[1], dtype=np.float32)
+    elif len(offer_args) == 4:
+        give_r, give_n, want_r, want_n = (int(x) for x in offer_args)
+        give = np.zeros(NUM_RESOURCES, dtype=np.float32)
+        want = np.zeros(NUM_RESOURCES, dtype=np.float32)
+        give[give_r] = float(give_n)
+        want[want_r] = float(want_n)
+    else:
+        raise TypeError("trade offer must be provided as (give_vec, want_vec) or (give_r, give_n, want_r, want_n)")
+    return give, want
+
+
 def trade_offer_value(
     state: GameState,
     proposer: int,
-    give_r: int,
-    give_n: int,
-    want_r: int,
-    want_n: int,
+    *offer_args,
 ) -> float:
     p = int(proposer)
-    give_r = int(give_r)
-    give_n = int(give_n)
-    want_r = int(want_r)
-    want_n = int(want_n)
-    if give_r == want_r or give_n <= 0 or want_n <= 0:
+    give, want = _coerce_trade_vectors(*offer_args)
+    if give.shape[0] != NUM_RESOURCES or want.shape[0] != NUM_RESOURCES:
+        return -1.0
+    if np.any(give < 0) or np.any(want < 0):
+        return -1.0
+    if int(give.sum()) <= 0 or int(want.sum()) <= 0:
+        return -1.0
+    if np.any((give > 0) & (want > 0)):
         return -1.0
     before = state.resources[p].astype(np.float32)
-    if before[give_r] < give_n:
+    if np.any(before < give):
         return -1.0
-    after = before.copy()
-    after[give_r] -= float(give_n)
-    after[want_r] += float(want_n)
+    after = before - give + want
     v_before = _estimate_trade_build_value(state, p, before)
     v_after = _estimate_trade_build_value(state, p, after)
     # Favor more efficient ratios unless hand is near discard threshold.
-    ratio_term = float(want_n) / max(1.0, float(give_n))
+    ratio_term = float(want.sum()) / max(1.0, float(give.sum()))
     near_discard = float(before.sum()) > 7.0
     efficiency_bonus = 0.15 * ratio_term + (0.10 if near_discard else 0.0)
     return float(np.clip((v_after - v_before) + efficiency_bonus, -1.0, 1.0))
@@ -654,26 +667,22 @@ def trade_offer_value(
 def trade_offer_counterparty_value(
     state: GameState,
     proposer: int,
-    give_r: int,
-    give_n: int,
-    want_r: int,
-    want_n: int,
+    *offer_args,
 ) -> float:
     """
     Utility proxy for how acceptable a proposed offer is to potential responders.
     Returns the best responder utility among legal responders (those who can pay "want").
     """
     p = int(proposer)
-    give_r = int(give_r)
-    give_n = int(give_n)
-    want_r = int(want_r)
-    want_n = int(want_n)
-    if give_r == want_r or give_n <= 0 or want_n <= 0:
+    give, want = _coerce_trade_vectors(*offer_args)
+    if give.shape[0] != NUM_RESOURCES or want.shape[0] != NUM_RESOURCES:
         return -1.0
-    give = np.zeros(NUM_RESOURCES, dtype=np.float32)
-    want = np.zeros(NUM_RESOURCES, dtype=np.float32)
-    give[give_r] = float(give_n)
-    want[want_r] = float(want_n)
+    if np.any(give < 0) or np.any(want < 0):
+        return -1.0
+    if int(give.sum()) <= 0 or int(want.sum()) <= 0:
+        return -1.0
+    if np.any((give > 0) & (want > 0)):
+        return -1.0
 
     best = -1.0
     found = False

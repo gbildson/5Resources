@@ -207,11 +207,11 @@ def _play_match_with_metrics(
         action = CATALOG.decode(action_id)
         state_before = env.state.copy()
         if player == int(focal_player):
+            if action.kind == "PROPOSE_TRADE":
+                focal_trade_offer_actions += 1
             if int(state_before.phase) == int(Phase.MAIN):
                 focal_main_turns += 1
-                if action.kind == "PROPOSE_TRADE":
-                    focal_trade_offer_actions += 1
-                elif action.kind == "BANK_TRADE":
+                if action.kind == "BANK_TRADE":
                     focal_trade_bank_actions += 1
             elif int(state_before.phase) == int(Phase.TRADE_PROPOSED):
                 focal_trade_response_opps += 1

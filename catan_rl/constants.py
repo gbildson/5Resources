@@ -44,11 +44,12 @@ class Phase(IntEnum):
     MOVE_ROBBER = 5
     ROB_PLAYER = 6
     MAIN = 7
-    TRADE_PROPOSED = 8
-    YEAR_OF_PLENTY = 9
-    MONOPOLY = 10
-    ROAD_BUILDING = 11
-    GAME_OVER = 12
+    TRADE_DRAFT = 8
+    TRADE_PROPOSED = 9
+    YEAR_OF_PLENTY = 10
+    MONOPOLY = 11
+    ROAD_BUILDING = 12
+    GAME_OVER = 13
 
 
 class DevCard(IntEnum):

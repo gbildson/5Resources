@@ -35,7 +35,15 @@ def _build_trade_action_masks() -> dict[str, torch.Tensor]:
     gen = torch.zeros((n,), dtype=torch.bool)
     resp = torch.zeros((n,), dtype=torch.bool)
     for i, a in enumerate(CATALOG.actions):
-        if a.kind in {"PROPOSE_TRADE", "BANK_TRADE"}:
+        if a.kind in {
+            "TRADE_ADD_GIVE",
+            "TRADE_ADD_WANT",
+            "TRADE_REMOVE_GIVE",
+            "TRADE_REMOVE_WANT",
+            "PROPOSE_TRADE",
+            "CANCEL_TRADE",
+            "BANK_TRADE",
+        }:
             gen[i] = True
         elif a.kind in {"ACCEPT_TRADE", "REJECT_TRADE"}:
             resp[i] = True
@@ -56,7 +64,7 @@ def _apply_trade_split_logits(
     trade_response_mask: torch.Tensor,
 ) -> torch.Tensor:
     phase_ids = _phase_ids_from_obs(obs)
-    main_rows = phase_ids == int(Phase.MAIN)
+    main_rows = (phase_ids == int(Phase.MAIN)) | (phase_ids == int(Phase.TRADE_DRAFT))
     resp_rows = phase_ids == int(Phase.TRADE_PROPOSED)
     if torch.any(main_rows) and torch.any(trade_generation_mask):
         tmp = logits[main_rows]
@@ -191,6 +199,7 @@ class PhaseAwareResidualPolicyValueNet(nn.Module):
             int(Phase.MOVE_ROBBER): "robber",
             int(Phase.ROB_PLAYER): "robber",
             int(Phase.MAIN): "main",
+            int(Phase.TRADE_DRAFT): "trade",
             int(Phase.TRADE_PROPOSED): "trade",
             int(Phase.YEAR_OF_PLENTY): "dev",
             int(Phase.MONOPOLY): "dev",
@@ -270,6 +279,7 @@ class StrategyPhaseAwareResidualPolicyValueNet(nn.Module):
             int(Phase.MOVE_ROBBER): "robber",
             int(Phase.ROB_PLAYER): "robber",
             int(Phase.MAIN): "main",
+            int(Phase.TRADE_DRAFT): "trade",
             int(Phase.TRADE_PROPOSED): "trade",
             int(Phase.YEAR_OF_PLENTY): "dev",
             int(Phase.MONOPOLY): "dev",
@@ -347,7 +357,17 @@ def _build_action_entity_maps() -> dict[str, torch.Tensor]:
             robber[i] = int(a.params[0])
         elif a.kind == "ROB_PLAYER":
             rob_player[i] = int(a.params[0])
-        elif a.kind in {"PROPOSE_TRADE", "ACCEPT_TRADE", "REJECT_TRADE", "BANK_TRADE"}:
+        elif a.kind in {
+            "TRADE_ADD_GIVE",
+            "TRADE_ADD_WANT",
+            "TRADE_REMOVE_GIVE",
+            "TRADE_REMOVE_WANT",
+            "PROPOSE_TRADE",
+            "CANCEL_TRADE",
+            "ACCEPT_TRADE",
+            "REJECT_TRADE",
+            "BANK_TRADE",
+        }:
             trade_mask[i] = True
     return {
         "settle_idx": settle,
@@ -477,6 +497,7 @@ class GraphEntityPolicyValueNet(nn.Module):
                 int(Phase.MOVE_ROBBER): "robber",
                 int(Phase.ROB_PLAYER): "robber",
                 int(Phase.MAIN): "main",
+                int(Phase.TRADE_DRAFT): "trade",
                 int(Phase.TRADE_PROPOSED): "trade",
                 int(Phase.YEAR_OF_PLENTY): "dev",
                 int(Phase.MONOPOLY): "dev",

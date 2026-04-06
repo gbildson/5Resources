@@ -144,7 +144,17 @@ def _print_top_actions(top: Iterable[tuple[int, float]]) -> None:
     print("  policy_top5:", " | ".join(rendered) if rendered else "n/a")
 
 
-TRADE_KINDS = {"PROPOSE_TRADE", "ACCEPT_TRADE", "REJECT_TRADE", "BANK_TRADE"}
+TRADE_KINDS = {
+    "TRADE_ADD_GIVE",
+    "TRADE_ADD_WANT",
+    "TRADE_REMOVE_GIVE",
+    "TRADE_REMOVE_WANT",
+    "PROPOSE_TRADE",
+    "CANCEL_TRADE",
+    "ACCEPT_TRADE",
+    "REJECT_TRADE",
+    "BANK_TRADE",
+}
 
 
 def _record_trade_event(
@@ -170,15 +180,19 @@ def _record_trade_event(
         "kind": action.kind,
     }
 
-    if action.kind == "PROPOSE_TRADE":
-        give_r, give_n, want_r, want_n = action.params
+    if action.kind in {"TRADE_ADD_GIVE", "TRADE_ADD_WANT", "TRADE_REMOVE_GIVE", "TRADE_REMOVE_WANT", "CANCEL_TRADE"}:
+        rec["bundle_give"] = state_before.trade_offer_give.astype(np.int64).tolist()
+        rec["bundle_want"] = state_before.trade_offer_want.astype(np.int64).tolist()
+    elif action.kind == "PROPOSE_TRADE":
         proposer_util = float(
-            trade_offer_value(state_before, int(player), int(give_r), int(give_n), int(want_r), int(want_n))
+            trade_offer_value(state_before, int(player), state_before.trade_offer_give, state_before.trade_offer_want)
         )
         rec["proposer_utility"] = proposer_util
         rec["best_responder_utility"] = float(
-            trade_offer_counterparty_value(state_before, int(player), int(give_r), int(give_n), int(want_r), int(want_n))
+            trade_offer_counterparty_value(state_before, int(player), state_before.trade_offer_give, state_before.trade_offer_want)
         )
+        rec["bundle_give"] = state_before.trade_offer_give.astype(np.int64).tolist()
+        rec["bundle_want"] = state_before.trade_offer_want.astype(np.int64).tolist()
     elif action.kind == "ACCEPT_TRADE":
         accepter_util = float(trade_accept_value(state_before, int(player)))
         rec["response_accept_utility"] = accepter_util
@@ -189,20 +203,18 @@ def _record_trade_event(
         offer_want = state_before.trade_offer_want.astype(np.int64)
         proposer_offer_util = 0.0
         if proposer >= 0 and int(np.sum(offer_give)) > 0 and int(np.sum(offer_want)) > 0:
-            give_r = int(np.argmax(offer_give))
-            want_r = int(np.argmax(offer_want))
-            give_n = int(offer_give[give_r])
-            want_n = int(offer_want[want_r])
-            proposer_offer_util = float(
-                trade_offer_value(state_before, proposer, give_r, give_n, want_r, want_n)
-            )
+            proposer_offer_util = float(trade_offer_value(state_before, proposer, offer_give, offer_want))
         rec["accepter_utility"] = accepter_util
         rec["proposer"] = proposer
         rec["proposer_offer_utility"] = proposer_offer_util
+        rec["bundle_give"] = offer_give.tolist()
+        rec["bundle_want"] = offer_want.tolist()
     elif action.kind == "REJECT_TRADE":
         rec["response_accept_utility"] = float(trade_accept_value(state_before, int(player)))
         rec["immediate_unlock"] = bool(trade_accept_immediate_build_gain(state_before, int(player)))
         rec["avoid_proposer"] = bool(trade_accept_should_avoid_proposer(state_before, int(player)))
+        rec["bundle_give"] = state_before.trade_offer_give.astype(np.int64).tolist()
+        rec["bundle_want"] = state_before.trade_offer_want.astype(np.int64).tolist()
     elif action.kind == "BANK_TRADE":
         give_r, give_n, want_r = action.params
         rec["bank_trade_utility"] = float(
@@ -301,6 +313,9 @@ def _print_trade_summary(events: list[dict]) -> None:
             util_bits.append(f"unlock={bool(e['immediate_unlock'])}")
         if "avoid_proposer" in e:
             util_bits.append(f"avoid={bool(e['avoid_proposer'])}")
+        if "bundle_give" in e and "bundle_want" in e:
+            util_bits.append(f"give={e['bundle_give']}")
+            util_bits.append(f"want={e['bundle_want']}")
         util_txt = (" " + " ".join(util_bits)) if util_bits else ""
         print(
             f"  step={int(e['step']):04d} player={int(e['player'])} "

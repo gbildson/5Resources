@@ -21,8 +21,13 @@ def test_trade_phase_accept_executes_and_returns_turn_to_proposer():
     env.state.resource_total[0] = 1
     env.state.resources[1, Resource.BRICK] = 1
     env.state.resource_total[1] = 1
+    env.state.public_recent_gain[1, Resource.BRICK] = 1.0
 
-    propose_id = CATALOG.encode(Action("PROPOSE_TRADE", (Resource.WOOD, 1, Resource.BRICK, 1)))
+    add_give_id = CATALOG.encode(Action("TRADE_ADD_GIVE", (Resource.WOOD,)))
+    add_want_id = CATALOG.encode(Action("TRADE_ADD_WANT", (Resource.BRICK,)))
+    propose_id = CATALOG.encode(Action("PROPOSE_TRADE"))
+    env.step(add_give_id)
+    env.step(add_want_id)
     res = env.step(propose_id)
     assert env.state.phase == Phase.TRADE_PROPOSED
     assert env.state.current_player == 1
@@ -42,8 +47,15 @@ def test_trade_phase_rejections_rotate_responders_then_end():
     _set_main_phase(env, player=0)
     env.state.resources[0, Resource.WOOD] = 1
     env.state.resource_total[0] = 1
+    env.state.resources[1, Resource.BRICK] = 1
+    env.state.resource_total[1] = 1
+    env.state.public_recent_gain[1, Resource.BRICK] = 1.0
 
-    propose_id = CATALOG.encode(Action("PROPOSE_TRADE", (Resource.WOOD, 1, Resource.BRICK, 1)))
+    add_give_id = CATALOG.encode(Action("TRADE_ADD_GIVE", (Resource.WOOD,)))
+    add_want_id = CATALOG.encode(Action("TRADE_ADD_WANT", (Resource.BRICK,)))
+    propose_id = CATALOG.encode(Action("PROPOSE_TRADE"))
+    env.step(add_give_id)
+    env.step(add_want_id)
     env.step(propose_id)
     assert env.state.current_player == 1
 
@@ -89,12 +101,20 @@ def test_trade_proposal_limit_per_turn_blocks_second_proposal():
 
     env.state.resources[0, Resource.WOOD] = 2
     env.state.resource_total[0] = 2
+    env.state.resources[1, Resource.BRICK] = 1
+    env.state.resource_total[1] = 1
+    env.state.public_recent_gain[1, Resource.BRICK] = 1.0
 
-    propose_id = CATALOG.encode(Action("PROPOSE_TRADE", (Resource.WOOD, 1, Resource.BRICK, 1)))
+    add_give_id = CATALOG.encode(Action("TRADE_ADD_GIVE", (Resource.WOOD,)))
+    add_want_id = CATALOG.encode(Action("TRADE_ADD_WANT", (Resource.BRICK,)))
+    propose_id = CATALOG.encode(Action("PROPOSE_TRADE"))
+    env.step(add_give_id)
+    env.step(add_want_id)
     env.step(propose_id)
     # Force turn back to proposer main to simulate another attempt in same turn.
     env.state.phase = Phase.MAIN
     env.state.current_player = 0
     mask = env.action_mask()
     legal_kinds = {CATALOG.decode(i).kind for i in CATALOG.legal_ids(mask)}
-    assert "PROPOSE_TRADE" not in legal_kinds
+    assert "TRADE_ADD_GIVE" not in legal_kinds
+    assert "TRADE_ADD_WANT" not in legal_kinds

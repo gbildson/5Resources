@@ -37,7 +37,7 @@ def observation_slices() -> dict[str, slice]:
     _take("longest_road_length", NUM_PLAYERS)
     _take("has_longest_road_and_largest_army", NUM_PLAYERS * 2)
     _take("public_vp", NUM_PLAYERS)
-    _take("phase_onehot", 13)
+    _take("phase_onehot", 14)
     _take("turn_features", 5)
     _take("trade_offer_give_want", NUM_RESOURCES * 2)
     _take("trade_proposer", 1)
@@ -716,7 +716,7 @@ def encode_observation(
     out.append(_rotate_players(np.stack([state.has_longest_road, state.has_largest_army], axis=1), cp).astype(np.float32).reshape(-1))
     out.append(np.clip(_rotate_players(state.public_vp, cp) / 10.0, 0.0, 1.0).astype(np.float32))
 
-    phase_oh = np.zeros(13, dtype=np.float32)
+    phase_oh = np.zeros(14, dtype=np.float32)
     phase_oh[state.phase] = 1.0
     out.append(phase_oh)
 

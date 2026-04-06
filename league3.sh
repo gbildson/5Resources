@@ -22,6 +22,7 @@ ANCHOR_TAG_FILTER="${ANCHOR_TAG_FILTER:-}"
 GUARANTEE_ANCHOR_EXPOSURE="${GUARANTEE_ANCHOR_EXPOSURE:-1}"
 ANCHOR_MIN_FROZEN_PROB="${ANCHOR_MIN_FROZEN_PROB:-0.40}"
 DYNAMIC_FROZEN_MAX="${DYNAMIC_FROZEN_MAX:-15}"
+FROZEN_SAMPLE_COUNT="${FROZEN_SAMPLE_COUNT:-3}"
 PROMOTION_GATE_ENABLE="${PROMOTION_GATE_ENABLE:-1}"
 PROMOTION_MIN_STRICT="${PROMOTION_MIN_STRICT:-0.43}"
 PROMOTION_MIN_WORST_SEAT="${PROMOTION_MIN_WORST_SEAT:-0.30}"
@@ -159,6 +160,62 @@ print(",".join(vals))
 PY
 }
 
+csv_sample_unique() {
+  local csv="$1"
+  local n="$2"
+  local seed="$3"
+  local anchor_csv="${4:-}"
+  local guarantee_anchor="${5:-0}"
+  python3 - <<'PY' "$csv" "$n" "$seed" "$anchor_csv" "$guarantee_anchor"
+import sys
+import numpy as np
+
+vals = [x for x in sys.argv[1].split(",") if x]
+seen = set()
+uniq = []
+for v in vals:
+    if v not in seen:
+        uniq.append(v)
+        seen.add(v)
+
+try:
+    n = int(sys.argv[2])
+except Exception:
+    n = 0
+try:
+    seed = int(sys.argv[3])
+except Exception:
+    seed = 0
+
+anchor_vals = [x for x in sys.argv[4].split(",") if x]
+guarantee_anchor = sys.argv[5] == "1"
+
+if n <= 0 or len(uniq) <= n:
+    print(",".join(uniq))
+    raise SystemExit
+
+rng = np.random.default_rng(seed)
+selected = []
+if guarantee_anchor and anchor_vals:
+    anchor_seen = set()
+    anchor_uniq = []
+    for v in anchor_vals:
+        if v in uniq and v not in anchor_seen:
+            anchor_uniq.append(v)
+            anchor_seen.add(v)
+    if anchor_uniq:
+        selected.append(anchor_uniq[int(rng.integers(len(anchor_uniq)))])
+
+remaining = [v for v in uniq if v not in selected]
+k = max(0, min(len(remaining), n - len(selected)))
+if k > 0:
+    idx = sorted(rng.choice(len(remaining), size=k, replace=False).tolist())
+    selected.extend(remaining[i] for i in idx)
+
+print(",".join(selected))
+PY
+}
+
 wait_for_slot() {
   while true; do
     local running
@@ -176,7 +233,7 @@ run_branch_cycle() {
   local cycle_dir="$3"
 
   local branch init_ckpt seed meta_prob heuristic_prob out_dir best_ckpt eval_out
-  local branch_mix_frozen
+  local branch_mix_frozen branch_frozen_pool
   branch="${BRANCHES[$idx]}"
   init_ckpt="${CURRENT_CKPTS[$idx]}"
   seed=$(( BRANCH_SEED_BASES[$idx] + cycle ))
@@ -189,6 +246,10 @@ anchor_min = float("$ANCHOR_MIN_FROZEN_PROB")
 print(max(mix_frozen, anchor_min))
 PY
 )
+  fi
+  branch_frozen_pool="$FROZEN_POOL_CSV"
+  if [[ "$FROZEN_SAMPLE_COUNT" -gt 0 ]]; then
+    branch_frozen_pool=$(csv_sample_unique "$FROZEN_POOL_CSV" "$FROZEN_SAMPLE_COUNT" "$seed" "$ANCHOR_POOL_CSV" "$GUARANTEE_ANCHOR_EXPOSURE")
   fi
   heuristic_prob=$(python3 - <<PY
 mix_random = float("$MIX_RANDOM")
@@ -208,6 +269,7 @@ PY
     echo "-> Skip train branch ${branch}; found existing $best_ckpt"
   else
     echo "-> Train branch ${branch} seed=${seed} init=${init_ckpt}"
+    echo "   frozen_subset=${branch_frozen_pool}"
     "$PYTHON_BIN" -u scripts/train_schedule.py \
       --init-checkpoint "$init_ckpt" \
       --use-opponent-mixture \
@@ -217,7 +279,7 @@ PY
       --mix-meta-prob "$meta_prob" \
       --mix-trade-friendly-prob "$MIX_TRADE_FRIENDLY" \
       --mix-frozen-prob "$branch_mix_frozen" \
-      --mix-frozen-checkpoints "$FROZEN_POOL_CSV" \
+      --mix-frozen-checkpoints "$branch_frozen_pool" \
       --total-updates "$TOTAL_UPDATES" \
       --report-every "$REPORT_EVERY" \
       --rollout-steps "$ROLLOUT_STEPS" \

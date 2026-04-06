@@ -51,12 +51,18 @@ class ActionCatalog:
         for p in range(NUM_PLAYERS):
             self._append(Action("ROB_PLAYER", (p,)))
 
-        # Limited offer templates for tractable action count.
+        # Iterative bargaining: construct a draft offer with bounded edit actions,
+        # then submit it once both sides are populated.
         for give in range(NUM_RESOURCES):
-            for want in range(NUM_RESOURCES):
-                if give != want:
-                    self._append(Action("PROPOSE_TRADE", (give, 1, want, 1)))
-                    self._append(Action("PROPOSE_TRADE", (give, 2, want, 1)))
+            self._append(Action("TRADE_ADD_GIVE", (give,)))
+        for want in range(NUM_RESOURCES):
+            self._append(Action("TRADE_ADD_WANT", (want,)))
+        for give in range(NUM_RESOURCES):
+            self._append(Action("TRADE_REMOVE_GIVE", (give,)))
+        for want in range(NUM_RESOURCES):
+            self._append(Action("TRADE_REMOVE_WANT", (want,)))
+        self._append(Action("PROPOSE_TRADE"))
+        self._append(Action("CANCEL_TRADE"))
 
         self._append(Action("ACCEPT_TRADE"))
         self._append(Action("REJECT_TRADE"))

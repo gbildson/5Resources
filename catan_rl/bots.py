@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .actions import CATALOG, Action
-from .constants import NUM_PLAYERS, NUM_RESOURCES, Phase, RESOURCE_COSTS
+from .constants import NUM_PLAYERS, NUM_RESOURCES, Phase, RESOURCE_COSTS, Resource
 from .encoding import observation_slices
 
 
@@ -47,7 +47,12 @@ class HeuristicAgent(Agent):
             "BUY_DEV_CARD": 6,
             "PLACE_ROAD": 5,
             "BANK_TRADE": 4,
+            "TRADE_ADD_WANT": 3,
+            "TRADE_ADD_GIVE": 3,
             "PROPOSE_TRADE": 3,
+            "TRADE_REMOVE_WANT": 1,
+            "TRADE_REMOVE_GIVE": 1,
+            "CANCEL_TRADE": 0,
             "ROLL_DICE": 2,
             "END_TURN": 1,
         }
@@ -311,32 +316,78 @@ class TradeFriendlyAgent(Agent):
         after = before - want.astype(np.float32) + give.astype(np.float32)
         return float(np.clip(self._estimate_build_value(after) - self._estimate_build_value(before), -1.0, 1.0))
 
-    def _score_propose(self, obs: np.ndarray, action: Action) -> float:
-        give_r, give_n, want_r, want_n = (int(x) for x in action.params)
+    def _current_trade_bundle(self, obs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        trade = obs[self._sl["trade_offer_give_want"]]
+        give = np.rint(np.clip(trade[:NUM_RESOURCES], 0.0, 1.0) * 4.0).astype(np.int64)
+        want = np.rint(np.clip(trade[NUM_RESOURCES:], 0.0, 1.0) * 4.0).astype(np.int64)
+        return give, want
+
+    def _draft_bundle_score(self, obs: np.ndarray, give: np.ndarray, want: np.ndarray) -> float:
         resources = self._self_resources(obs)
-        if resources[give_r] < give_n:
+        give = np.asarray(give, dtype=np.int64)
+        want = np.asarray(want, dtype=np.int64)
+        if np.any((give > 0) & (want > 0)):
             return -1e9
         needed, can_build_now = self._build_need_profile(obs)
         total = int(resources.sum())
         near_discard = total > 7
         score = 0.0
-        if want_r in needed:
-            score += 2.0
-        if give_r in needed:
-            score -= 1.5
-        if give_n == 2:
-            if near_discard:
-                score += 1.2
-            if give_r not in needed and resources[give_r] >= 3:
-                score += 0.8
+        for want_r in np.flatnonzero(want > 0).tolist():
+            if int(want_r) in needed:
+                score += 0.9 * float(want[int(want_r)])
+            elif near_discard and int(want_r) in (int(Resource.WHEAT), int(Resource.ORE)):
+                score += 0.25 * float(want[int(want_r)])
             else:
-                score -= 0.5
-        else:
-            score += 0.2
-        if can_build_now and not near_discard and give_n == 1:
-            score -= 0.8
-        score += 0.3 * float(want_n) / max(1.0, float(give_n))
+                score -= 0.15 * float(want[int(want_r)])
+        for give_r in np.flatnonzero(give > 0).tolist():
+            give_n = int(give[int(give_r)])
+            if resources[int(give_r)] < give_n:
+                return -1e9
+            if int(give_r) in needed and resources[int(give_r)] <= give_n + 1:
+                score -= 0.8 * float(give_n)
+            elif near_discard or resources[int(give_r)] >= give_n + 3:
+                score += 0.25 * float(give_n)
+            else:
+                score -= 0.10 * float(give_n)
+        give_total = int(give.sum())
+        want_total = int(want.sum())
+        if can_build_now and not near_discard and give_total <= want_total and give_total > 0:
+            score -= 0.6
+        if give_total > 0 and want_total > 0:
+            before = resources.astype(np.float32)
+            after = before - give.astype(np.float32) + want.astype(np.float32)
+            score += float(np.clip(self._estimate_build_value(after) - self._estimate_build_value(before), -1.0, 1.0))
+            score += 0.20 * float(want_total) / max(1.0, float(give_total))
         return score
+
+    def _score_trade_draft_action(self, obs: np.ndarray, phase: int, action: Action) -> float:
+        give, want = self._current_trade_bundle(obs)
+        if phase == int(Phase.MAIN):
+            give[:] = 0
+            want[:] = 0
+        if action.kind == "TRADE_ADD_GIVE":
+            (give_r,) = action.params
+            give[int(give_r)] += 1
+            return self._draft_bundle_score(obs, give, want)
+        if action.kind == "TRADE_ADD_WANT":
+            (want_r,) = action.params
+            want[int(want_r)] += 1
+            return self._draft_bundle_score(obs, give, want)
+        if action.kind == "TRADE_REMOVE_GIVE":
+            (give_r,) = action.params
+            give[int(give_r)] = max(0, int(give[int(give_r)]) - 1)
+            return self._draft_bundle_score(obs, give, want)
+        if action.kind == "TRADE_REMOVE_WANT":
+            (want_r,) = action.params
+            want[int(want_r)] = max(0, int(want[int(want_r)]) - 1)
+            return self._draft_bundle_score(obs, give, want)
+        if action.kind == "PROPOSE_TRADE":
+            if int(give.sum()) <= 0 or int(want.sum()) <= 0:
+                return -1e9
+            return self._draft_bundle_score(obs, give, want) + 0.4
+        if action.kind == "CANCEL_TRADE":
+            return -0.5
+        return -1e9
 
     @staticmethod
     def _base_action_score(kind: str) -> float:
@@ -354,6 +405,12 @@ class TradeFriendlyAgent(Agent):
             return 3.0
         if kind == "BANK_TRADE":
             return 2.0
+        if kind in {"TRADE_ADD_GIVE", "TRADE_ADD_WANT"}:
+            return 1.8
+        if kind in {"TRADE_REMOVE_GIVE", "TRADE_REMOVE_WANT"}:
+            return 0.6
+        if kind == "CANCEL_TRADE":
+            return 0.0
         if kind == "END_TURN":
             return 1.0
         return 0.0
@@ -378,8 +435,15 @@ class TradeFriendlyAgent(Agent):
 
         scored_actions: list[tuple[int, float]] = []
         for a_id, action in legal_actions:
-            if action.kind == "PROPOSE_TRADE":
-                score = self._score_propose(obs, action)
+            if action.kind in {
+                "TRADE_ADD_GIVE",
+                "TRADE_ADD_WANT",
+                "TRADE_REMOVE_GIVE",
+                "TRADE_REMOVE_WANT",
+                "PROPOSE_TRADE",
+                "CANCEL_TRADE",
+            }:
+                score = self._score_trade_draft_action(obs, phase, action)
             else:
                 score = self._base_action_score(action.kind)
             scored_actions.append((int(a_id), float(score)))

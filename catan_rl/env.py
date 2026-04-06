@@ -17,6 +17,10 @@ from .constants import (
     WIN_VP,
 )
 from .state import GameState, new_game_state
+from .strategy_metrics import trade_offer_value
+
+
+MAX_PLAYER_TRADE_BUNDLE_CARDS = 2
 
 
 @dataclass
@@ -100,7 +104,7 @@ class CatanEnv:
         player = self.state.current_player
         before_phase = self.state.phase
         self._apply_action(player, action)
-        if before_phase == Phase.MAIN and action.kind != "END_TURN":
+        if before_phase in (Phase.MAIN, Phase.TRADE_DRAFT) and action.kind != "END_TURN":
             self._main_actions_this_turn += 1
         self._update_vp_and_achievements()
         winner = self._check_winner()
@@ -127,9 +131,9 @@ class CatanEnv:
             return False
         if (
             self.max_main_actions_per_turn is not None
-            and s.phase == Phase.MAIN
+            and s.phase in (Phase.MAIN, Phase.TRADE_DRAFT)
             and self._main_actions_this_turn >= self.max_main_actions_per_turn
-            and action.kind != "END_TURN"
+            and action.kind not in {"END_TURN", "PROPOSE_TRADE", "CANCEL_TRADE"}
         ):
             return False
 
@@ -223,49 +227,68 @@ class CatanEnv:
             robbable = [q for q in adj if q != p and s.resource_total[q] > 0]
             return target in robbable
 
+        if action.kind == "TRADE_ADD_GIVE":
+            if not self.allow_player_trade:
+                return False
+            if s.phase not in (Phase.MAIN, Phase.TRADE_DRAFT):
+                return False
+            if s.phase == Phase.MAIN and not self._can_start_trade_draft():
+                return False
+            if s.phase == Phase.TRADE_DRAFT and int(s.trade_proposer) != int(p):
+                return False
+            (give_r,) = action.params
+            if self._trade_bundle_card_count(s.trade_offer_give) >= MAX_PLAYER_TRADE_BUNDLE_CARDS:
+                return False
+            if int(s.trade_offer_want[int(give_r)]) > 0:
+                return False
+            return int(s.resources[p, int(give_r)]) > int(s.trade_offer_give[int(give_r)])
+
+        if action.kind == "TRADE_ADD_WANT":
+            if not self.allow_player_trade:
+                return False
+            if s.phase not in (Phase.MAIN, Phase.TRADE_DRAFT):
+                return False
+            if s.phase == Phase.MAIN and not self._can_start_trade_draft():
+                return False
+            if s.phase == Phase.TRADE_DRAFT and int(s.trade_proposer) != int(p):
+                return False
+            (want_r,) = action.params
+            if self._trade_bundle_card_count(s.trade_offer_want) >= MAX_PLAYER_TRADE_BUNDLE_CARDS:
+                return False
+            return int(s.trade_offer_give[int(want_r)]) <= 0
+
+        if action.kind == "TRADE_REMOVE_GIVE":
+            if not self.allow_player_trade:
+                return False
+            if s.phase != Phase.TRADE_DRAFT or int(s.trade_proposer) != int(p):
+                return False
+            (give_r,) = action.params
+            return int(s.trade_offer_give[int(give_r)]) > 0
+
+        if action.kind == "TRADE_REMOVE_WANT":
+            if not self.allow_player_trade:
+                return False
+            if s.phase != Phase.TRADE_DRAFT or int(s.trade_proposer) != int(p):
+                return False
+            (want_r,) = action.params
+            return int(s.trade_offer_want[int(want_r)]) > 0
+
         if action.kind == "PROPOSE_TRADE":
             if not self.allow_player_trade:
                 return False
-            if s.phase != Phase.MAIN:
+            if s.phase != Phase.TRADE_DRAFT or int(s.trade_proposer) != int(p):
                 return False
-            if (
-                self.max_player_trade_proposals_per_turn is not None
-                and self._trade_proposals_this_turn >= self.max_player_trade_proposals_per_turn
-            ):
+            if not self._trade_bundle_ready_for_submit(p):
                 return False
-            give_r, give_n, want_r, want_n = action.params
-            if give_r == want_r or give_n <= 0 or want_n <= 0:
-                return False
-            if s.resources[p, give_r] < give_n:
-                return False
-            # Public-info optimistic feasibility filter (no private-hand leakage):
-            # keep offers that at least one responder is plausibly able to satisfy.
-            any_plausible_responder = False
-            for q in range(NUM_PLAYERS):
-                if q == p:
-                    continue
-                total_cards = int(s.resource_total[q])
-                if total_cards < want_n:
-                    continue
-                recent_gain_r = float(s.public_recent_gain[q, int(want_r)])
-                recent_spend_r = float(s.public_recent_spend[q, int(want_r)])
-                # Optimistic representative estimate of likely possession for wanted resource.
-                likely_have_want = (recent_gain_r - 0.50 * recent_spend_r) >= 0.15
-                # If hand is moderately large, allow exploratory proposals for the wanted type.
-                hand_overflow_hint = total_cards >= int(want_n + 2)
-                if likely_have_want or hand_overflow_hint:
-                    any_plausible_responder = True
-                    break
-            if not any_plausible_responder:
+            if not self._trade_offer_has_plausible_responder(p, s.trade_offer_want):
                 return False
             if self.trade_action_mode == "full":
                 return True
-            return self._is_guided_trade_offer_legal(
-                player=p,
-                give_r=int(give_r),
-                give_n=int(give_n),
-                want_r=int(want_r),
-                want_n=int(want_n),
+            return self._is_guided_trade_bundle_legal(player=p)
+
+        if action.kind == "CANCEL_TRADE":
+            return bool(
+                self.allow_player_trade and s.phase == Phase.TRADE_DRAFT and int(s.trade_proposer) == int(p)
             )
 
         if action.kind in ("ACCEPT_TRADE", "REJECT_TRADE"):
@@ -461,18 +484,40 @@ class CatanEnv:
             s.phase = Phase.MAIN if s.has_rolled else Phase.PRE_ROLL
             return
 
+        if action.kind == "TRADE_ADD_GIVE":
+            (give_r,) = action.params
+            self._begin_trade_draft(player)
+            s.trade_offer_give[int(give_r)] += 1
+            return
+
+        if action.kind == "TRADE_ADD_WANT":
+            (want_r,) = action.params
+            self._begin_trade_draft(player)
+            s.trade_offer_want[int(want_r)] += 1
+            return
+
+        if action.kind == "TRADE_REMOVE_GIVE":
+            (give_r,) = action.params
+            s.trade_offer_give[int(give_r)] -= 1
+            return
+
+        if action.kind == "TRADE_REMOVE_WANT":
+            (want_r,) = action.params
+            s.trade_offer_want[int(want_r)] -= 1
+            return
+
         if action.kind == "PROPOSE_TRADE":
-            give_r, give_n, want_r, want_n = action.params
             self._trade_proposals_this_turn += 1
             s.public_trade_offers[player] += 1.0
-            s.trade_offer_give[:] = 0
-            s.trade_offer_want[:] = 0
-            s.trade_offer_give[give_r] = give_n
-            s.trade_offer_want[want_r] = want_n
-            s.trade_proposer = player
             s.trade_responses[:] = 0
             s.phase = Phase.TRADE_PROPOSED
             s.current_player = self._next_trade_responder(player)
+            return
+
+        if action.kind == "CANCEL_TRADE":
+            self._clear_trade()
+            s.phase = Phase.MAIN
+            s.current_player = player
             return
 
         if action.kind in ("ACCEPT_TRADE", "REJECT_TRADE"):
@@ -720,47 +765,94 @@ class CatanEnv:
                     needed.add(int(r))
         return needed, can_build_now
 
-    def _is_guided_trade_offer_legal(
-        self,
-        player: int,
-        give_r: int,
-        give_n: int,
-        want_r: int,
-        want_n: int,
-    ) -> bool:
-        if want_n != 1:
+    @staticmethod
+    def _trade_bundle_card_count(vec: np.ndarray) -> int:
+        return int(np.asarray(vec, dtype=np.int64).sum())
+
+    def _can_start_trade_draft(self) -> bool:
+        return not (
+            self.max_player_trade_proposals_per_turn is not None
+            and self._trade_proposals_this_turn >= self.max_player_trade_proposals_per_turn
+        )
+
+    def _trade_bundle_ready_for_submit(self, proposer: int) -> bool:
+        give = np.asarray(self.state.trade_offer_give, dtype=np.int64)
+        want = np.asarray(self.state.trade_offer_want, dtype=np.int64)
+        give_total = self._trade_bundle_card_count(give)
+        want_total = self._trade_bundle_card_count(want)
+        if give_total <= 0 or want_total <= 0:
             return False
+        if give_total > MAX_PLAYER_TRADE_BUNDLE_CARDS or want_total > MAX_PLAYER_TRADE_BUNDLE_CARDS:
+            return False
+        if np.any((give > 0) & (want > 0)):
+            return False
+        return bool(np.all(self.state.resources[int(proposer)] >= give))
+
+    def _trade_offer_has_plausible_responder(self, proposer: int, want: np.ndarray) -> bool:
+        want = np.asarray(want, dtype=np.int64)
+        want_total = int(want.sum())
+        if want_total <= 0:
+            return False
+        wanted_resources = np.flatnonzero(want > 0)
+        for q in range(NUM_PLAYERS):
+            if q == int(proposer):
+                continue
+            total_cards = int(self.state.resource_total[q])
+            if total_cards < want_total:
+                continue
+            optimistic_mass = 0.0
+            for want_r in wanted_resources.tolist():
+                recent_gain_r = float(self.state.public_recent_gain[q, int(want_r)])
+                recent_spend_r = float(self.state.public_recent_spend[q, int(want_r)])
+                optimistic_mass += max(0.0, recent_gain_r - 0.50 * recent_spend_r)
+            if optimistic_mass >= 0.15 * float(len(wanted_resources)):
+                return True
+            if total_cards >= int(want_total + len(wanted_resources) + 1):
+                return True
+        return False
+
+    def _begin_trade_draft(self, player: int) -> None:
+        s = self.state
+        if int(s.phase) != int(Phase.TRADE_DRAFT):
+            s.trade_offer_give[:] = 0
+            s.trade_offer_want[:] = 0
+            s.trade_responses[:] = 0
+        s.trade_proposer = int(player)
+        s.phase = Phase.TRADE_DRAFT
+        s.current_player = int(player)
+
+    def _is_guided_trade_bundle_legal(self, player: int) -> bool:
+        if not self._trade_bundle_ready_for_submit(player):
+            return False
+        give = np.asarray(self.state.trade_offer_give, dtype=np.int64)
+        want = np.asarray(self.state.trade_offer_want, dtype=np.int64)
+        give_total = self._trade_bundle_card_count(give)
+        want_total = self._trade_bundle_card_count(want)
         total_resources = int(self.state.resource_total[player])
         near_discard = total_resources > 7
         needed_resources, can_build_now = self._trade_need_profile(player)
+        want_ids = set(int(r) for r in np.flatnonzero(want > 0))
+        give_ids = set(int(r) for r in np.flatnonzero(give > 0))
 
-        # If we can already execute a build and are not at discard risk, be conservative with 1-for-1.
-        # Keep room for selective 2-for-1 overflow/smoothing offers.
-        if can_build_now and not near_discard and give_n == 1:
+        if can_build_now and not near_discard and give_total <= want_total:
             return False
 
-        # Only ask for near-term useful resources, except allow ore/wheat conversion under discard pressure.
-        if want_r not in needed_resources:
-            if not (near_discard and want_r in (3, 4)):
+        for want_r in want_ids:
+            if want_r not in needed_resources and not (near_discard and want_r in (3, 4)):
                 return False
 
-        # Avoid giving away scarce resources that we also need soon.
-        if give_r in needed_resources and int(self.state.resources[player, give_r]) <= give_n + 1:
-            return False
+        for give_r in give_ids:
+            if give_r in needed_resources and int(self.state.resources[player, give_r]) <= int(give[give_r]) + 1:
+                return False
 
-        if give_n == 2:
-            have_give = int(self.state.resources[player, give_r])
-            # 2-for-1 is often used to offload redundant cards. Allow more frequently than before.
-            if near_discard:
-                return True
-            # Classic "redundant -> needed" conversion.
-            if give_r not in needed_resources and want_r in needed_resources and have_give >= 3:
-                return True
-            # High-surplus dump even when need profile is noisy.
-            if have_give >= 5:
-                return True
-            return False
-        elif give_n != 1:
+        if give_total == MAX_PLAYER_TRADE_BUNDLE_CARDS and not near_discard:
+            high_surplus = any(int(self.state.resources[player, r]) >= int(give[r]) + 3 for r in give_ids)
+            redundant_dump = any(r not in needed_resources for r in give_ids)
+            if not high_surplus and not redundant_dump:
+                return False
+
+        proposer_util = float(trade_offer_value(self.state, int(player), give, want))
+        if proposer_util < -0.05:
             return False
 
         return True

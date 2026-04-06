@@ -580,6 +580,13 @@ def main() -> None:
 
     env = CatanEnv(seed=args.seed, **env_kwargs)
     obs, _ = env.reset(seed=args.seed)
+    model_metadata.update(
+        {
+            "obs_dim": int(obs.shape[0]),
+            "action_dim": int(env.action_mask().shape[0]),
+            "trade_protocol_version": "iterative_bundle_v1",
+        }
+    )
     model = build_policy_value_net(
         obs_dim=obs.shape[0],
         action_dim=env.action_mask().shape[0],

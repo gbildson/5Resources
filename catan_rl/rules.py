@@ -32,6 +32,8 @@ def check_invariants(state: GameState) -> list[str]:
         errs.append("invalid trade proposer")
     if state.trade_proposer == -1 and (np.any(state.trade_offer_give) or np.any(state.trade_offer_want)):
         errs.append("trade vectors nonzero without proposer")
+    if state.trade_proposer >= 0 and state.phase not in (int(Phase.TRADE_DRAFT), int(Phase.TRADE_PROPOSED)):
+        errs.append("trade proposer set outside trade phases")
     if np.any(state.must_discard < 0) or np.any(state.must_discard > 1):
         errs.append("must_discard non-binary")
     if np.any(state.trade_responses < 0) or np.any(state.trade_responses > 2):

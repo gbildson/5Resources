@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 from ..actions import Action, CATALOG
-from ..constants import Building, DevCard, Phase, Resource
+from ..constants import Building, DevCard, Phase, Resource, RESOURCE_COSTS
 from ..bots import RandomLegalAgent
 from ..env import CatanEnv
 from ..eval import tournament
@@ -742,6 +742,93 @@ def main_phase_road_purpose_shaping(
 
 PLAY_KNIGHT_ACTION_ID = CATALOG.encode(Action("PLAY_KNIGHT"))
 ACCEPT_TRADE_ACTION_ID = CATALOG.encode(Action("ACCEPT_TRADE"))
+TRADE_DRAFT_EDIT_KINDS = {"TRADE_ADD_GIVE", "TRADE_ADD_WANT", "TRADE_REMOVE_GIVE", "TRADE_REMOVE_WANT"}
+
+
+def _trade_draft_need_profile(state_before, player: int) -> tuple[set[int], bool]:
+    resources = state_before.resources[int(player)]
+    build_costs = []
+    if state_before.roads_left[int(player)] > 0:
+        build_costs.append(np.asarray(RESOURCE_COSTS["road"], dtype=np.int64))
+    if state_before.settlements_left[int(player)] > 0:
+        build_costs.append(np.asarray(RESOURCE_COSTS["settlement"], dtype=np.int64))
+    if state_before.cities_left[int(player)] > 0:
+        build_costs.append(np.asarray(RESOURCE_COSTS["city"], dtype=np.int64))
+    if state_before.dev_deck_remaining > 0:
+        build_costs.append(np.asarray(RESOURCE_COSTS["dev"], dtype=np.int64))
+
+    needed: set[int] = set()
+    can_build_now = False
+    for cost in build_costs:
+        deficit = np.maximum(cost - resources, 0)
+        miss = int(deficit.sum())
+        if miss == 0:
+            can_build_now = True
+        if miss <= 2:
+            for r in np.flatnonzero(deficit > 0):
+                needed.add(int(r))
+    return needed, can_build_now
+
+
+def _trade_draft_after_action(state_before, action: Action) -> tuple[np.ndarray, np.ndarray] | None:
+    give = np.asarray(state_before.trade_offer_give, dtype=np.int64).copy()
+    want = np.asarray(state_before.trade_offer_want, dtype=np.int64).copy()
+    if int(state_before.phase) == int(Phase.MAIN):
+        give[:] = 0
+        want[:] = 0
+    if action.kind == "TRADE_ADD_GIVE":
+        (give_r,) = action.params
+        give[int(give_r)] += 1
+    elif action.kind == "TRADE_ADD_WANT":
+        (want_r,) = action.params
+        want[int(want_r)] += 1
+    elif action.kind == "TRADE_REMOVE_GIVE":
+        (give_r,) = action.params
+        give[int(give_r)] = max(0, int(give[int(give_r)]) - 1)
+    elif action.kind == "TRADE_REMOVE_WANT":
+        (want_r,) = action.params
+        want[int(want_r)] = max(0, int(want[int(want_r)]) - 1)
+    else:
+        return None
+    return give, want
+
+
+def _trade_draft_bundle_score(state_before, acting_player: int, give: np.ndarray, want: np.ndarray) -> float:
+    player = int(acting_player)
+    give = np.asarray(give, dtype=np.int64)
+    want = np.asarray(want, dtype=np.int64)
+    total_give = int(give.sum())
+    total_want = int(want.sum())
+    if total_give == 0 and total_want == 0:
+        return 0.0
+    if np.any((give > 0) & (want > 0)):
+        return -1.0
+
+    needed_resources, can_build_now = _trade_draft_need_profile(state_before, player)
+    total_resources = int(state_before.resource_total[player])
+    near_discard = total_resources > 7
+    score = 0.0
+    for want_r in np.flatnonzero(want > 0).tolist():
+        if int(want_r) in needed_resources:
+            score += 0.60 * float(want[int(want_r)])
+        elif near_discard and int(want_r) in (int(Resource.WHEAT), int(Resource.ORE)):
+            score += 0.25 * float(want[int(want_r)])
+        else:
+            score -= 0.15 * float(want[int(want_r)])
+    for give_r in np.flatnonzero(give > 0).tolist():
+        have = int(state_before.resources[player, int(give_r)])
+        if int(give_r) in needed_resources and have <= int(give[int(give_r)]) + 1:
+            score -= 0.60 * float(give[int(give_r)])
+        elif near_discard or have >= int(give[int(give_r)]) + 3:
+            score += 0.20 * float(give[int(give_r)])
+        else:
+            score -= 0.10 * float(give[int(give_r)])
+    if can_build_now and not near_discard and total_give <= total_want:
+        score -= 0.25
+    if total_give > 0 and total_want > 0:
+        score += float(trade_offer_value(state_before, player, give, want))
+        score += 0.50 * float(trade_offer_counterparty_value(state_before, player, give, want))
+    return float(np.clip(score, -2.0, 2.0))
 
 
 def force_knight_bootstrap_action(
@@ -834,16 +921,27 @@ def force_trade_bootstrap_action(
                 return int(ACCEPT_TRADE_ACTION_ID), True
         return int(chosen_action_id), False
 
+    if phase == int(Phase.TRADE_DRAFT):
+        if int(action_mask[CATALOG.encode(Action("PROPOSE_TRADE"))]) > 0:
+            submit_util = float(
+                trade_offer_value(state_before, player, state_before.trade_offer_give, state_before.trade_offer_want)
+            )
+            if submit_util > 0.0:
+                return int(CATALOG.encode(Action("PROPOSE_TRADE"))), True
+        return int(chosen_action_id), False
+
     if phase == int(Phase.MAIN):
         legal_ids = np.flatnonzero(np.asarray(action_mask, dtype=np.int64) > 0)
         best_id = -1
         best_util = -1e9
         for aid in legal_ids.tolist():
             action = CATALOG.decode(int(aid))
-            if action.kind != "PROPOSE_TRADE":
+            if action.kind not in TRADE_DRAFT_EDIT_KINDS:
                 continue
-            give_r, give_n, want_r, want_n = action.params
-            util = float(trade_offer_value(state_before, player, int(give_r), int(give_n), int(want_r), int(want_n)))
+            draft_after = _trade_draft_after_action(state_before, action)
+            if draft_after is None:
+                continue
+            util = _trade_draft_bundle_score(state_before, player, draft_after[0], draft_after[1])
             if util > best_util:
                 best_util = util
                 best_id = int(aid)
@@ -874,16 +972,30 @@ def trade_value_shaping(
     action = CATALOG.decode(int(action_id))
     util = 0.0
     shaped = 0.0
-    if action.kind == "PROPOSE_TRADE" and (trade_offer_coef != 0.0 or trade_offer_counterparty_coef != 0.0):
-        give_r, give_n, want_r, want_n = action.params
-        util = trade_offer_value(state_before, int(acting_player), int(give_r), int(give_n), int(want_r), int(want_n))
+    if action.kind in TRADE_DRAFT_EDIT_KINDS and (trade_offer_coef != 0.0 or trade_offer_counterparty_coef != 0.0):
+        before_score = _trade_draft_bundle_score(
+            state_before,
+            int(acting_player),
+            state_before.trade_offer_give,
+            state_before.trade_offer_want,
+        )
+        draft_after = _trade_draft_after_action(state_before, action)
+        if draft_after is not None:
+            after_score = _trade_draft_bundle_score(state_before, int(acting_player), draft_after[0], draft_after[1])
+            util = float(after_score - before_score)
+            shaped = float(trade_offer_coef) * util
+    elif action.kind == "PROPOSE_TRADE" and (trade_offer_coef != 0.0 or trade_offer_counterparty_coef != 0.0):
+        util = trade_offer_value(
+            state_before,
+            int(acting_player),
+            state_before.trade_offer_give,
+            state_before.trade_offer_want,
+        )
         counter_util = trade_offer_counterparty_value(
             state_before,
             int(acting_player),
-            int(give_r),
-            int(give_n),
-            int(want_r),
-            int(want_n),
+            state_before.trade_offer_give,
+            state_before.trade_offer_want,
         )
         shaped = float(trade_offer_coef) * util + float(trade_offer_counterparty_coef) * counter_util
     elif action.kind == "ACCEPT_TRADE" and trade_accept_coef != 0.0:
