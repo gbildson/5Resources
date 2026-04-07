@@ -754,6 +754,67 @@ def trade_accept_value(state: GameState, responder: int) -> float:
     return float(np.clip(own_gain - float(penalty_coef) * float(proposer_gain), -1.0, 1.0))
 
 
+def _relative_opponents(values: np.ndarray, player: int) -> np.ndarray:
+    p = int(player)
+    return np.asarray([values[(p + offset) % NUM_PLAYERS] for offset in range(1, NUM_PLAYERS)], dtype=np.float32)
+
+
+def _trade_response_target_active(state: GameState, player: int) -> bool:
+    p = int(player)
+    proposer = int(state.trade_proposer)
+    return bool(
+        int(state.phase) == int(Phase.TRADE_PROPOSED)
+        and proposer >= 0
+        and proposer != p
+        and int(state.trade_responses[p]) == 0
+    )
+
+
+def opponent_danger_targets(state: GameState, player: int, *, threat_dev_card_weight: float = 0.7) -> dict[str, float]:
+    p = int(player)
+    public_vp = state.public_vp.astype(np.float32)
+    dev_counts = (state.dev_cards_hidden + state.dev_cards_bought_this_turn).sum(axis=1).astype(np.float32)
+    road_len = state.longest_road_length.astype(np.float32)
+    knight_len = state.knights_played.astype(np.float32)
+    resource_total = state.resource_total.astype(np.float32)
+    has_road = state.has_longest_road.astype(np.float32)
+    has_army = state.has_largest_army.astype(np.float32)
+
+    scores = np.zeros(NUM_PLAYERS, dtype=np.float32)
+    self_vp = float(public_vp[p])
+    self_road = float(road_len[p])
+    self_knights = float(knight_len[p])
+    for q in range(NUM_PLAYERS):
+        if q == p:
+            continue
+        vp_term = np.clip(float(public_vp[q]) / 10.0, 0.0, 1.0)
+        dev_term = np.clip(float(dev_counts[q]) / 5.0, 0.0, 1.0)
+        road_term = np.clip(float(road_len[q]) / 10.0, 0.0, 1.0)
+        knight_term = np.clip(float(knight_len[q]) / 6.0, 0.0, 1.0)
+        card_term = np.clip(float(resource_total[q]) / 12.0, 0.0, 1.0)
+        vp_lead_term = np.clip((float(public_vp[q]) - self_vp + 2.0) / 6.0, 0.0, 1.0)
+        road_race_term = np.clip((float(road_len[q]) - self_road + 2.0) / 6.0, 0.0, 1.0)
+        army_race_term = np.clip((float(knight_len[q]) - self_knights + 1.0) / 4.0, 0.0, 1.0)
+        score = (
+            0.34 * vp_term
+            + 0.15 * dev_term * float(threat_dev_card_weight)
+            + 0.10 * road_term
+            + 0.08 * knight_term
+            + 0.08 * card_term
+            + 0.14 * vp_lead_term
+            + 0.06 * road_race_term
+            + 0.03 * army_race_term
+            + 0.01 * float(has_road[q])
+            + 0.01 * float(has_army[q])
+        )
+        if float(public_vp[q] + threat_dev_card_weight * dev_counts[q]) >= 8.0:
+            score += 0.05
+        scores[q] = float(np.clip(score, 0.0, 1.0))
+
+    rel = _relative_opponents(scores, p)
+    return {f"opponent_danger_opp{i + 1}": float(rel[i]) for i in range(NUM_PLAYERS - 1)}
+
+
 def strategic_evaluator_snapshot(state: GameState, player: int, *, threat_dev_card_weight: float = 0.7) -> dict:
     p = int(player)
     city_candidates = []
@@ -770,6 +831,7 @@ def strategic_evaluator_snapshot(state: GameState, player: int, *, threat_dev_ca
         "robber_block_quality": robber_hex_score,
         "race_pressure": race,
         "build_readiness": readiness,
+        "opponent_danger": opponent_danger_targets(state, p, threat_dev_card_weight=float(threat_dev_card_weight)),
     }
 
 
@@ -782,11 +844,17 @@ AUX_LABEL_KEYS = (
     "ready_settlement_turns",
     "ready_city_turns",
     "ready_dev_turns",
+    "trade_accept_value",
+    "trade_accept_immediate_build_gain",
+    "trade_accept_should_take",
+    "opponent_danger_opp1",
+    "opponent_danger_opp2",
+    "opponent_danger_opp3",
 )
 
 
-def strategic_aux_targets(snapshot: dict) -> dict[str, float]:
-    return {
+def strategic_aux_targets(snapshot: dict, state: GameState | None = None, player: int | None = None) -> dict[str, float]:
+    out = {
         "city_top_delta_score": float(snapshot["city_top_delta_score"]),
         "robber_block_quality": float(snapshot["robber_block_quality"]["quality_score"]),
         "longest_road_pressure": float(snapshot["race_pressure"]["longest_road_pressure"]),
@@ -795,7 +863,30 @@ def strategic_aux_targets(snapshot: dict) -> dict[str, float]:
         "ready_settlement_turns": float(snapshot["build_readiness"]["settlement"]["estimated_turns"]),
         "ready_city_turns": float(snapshot["build_readiness"]["city"]["estimated_turns"]),
         "ready_dev_turns": float(snapshot["build_readiness"]["dev"]["estimated_turns"]),
+        "trade_accept_value": 0.0,
+        "trade_accept_immediate_build_gain": 0.0,
+        "trade_accept_should_take": 0.0,
     }
+    out.update({k: float(v) for k, v in snapshot["opponent_danger"].items()})
+    if state is not None and player is not None and _trade_response_target_active(state, int(player)):
+        accept_value = float(trade_accept_value(state, int(player)))
+        immediate_gain = float(1.0 if trade_accept_immediate_build_gain(state, int(player)) else 0.0)
+        out["trade_accept_value"] = accept_value
+        out["trade_accept_immediate_build_gain"] = immediate_gain
+        out["trade_accept_should_take"] = float(1.0 if accept_value > 0.0 else 0.0)
+    return out
+
+
+def strategic_aux_target_weights(state: GameState, player: int) -> dict[str, float]:
+    weights = {k: 1.0 for k in AUX_LABEL_KEYS}
+    if not _trade_response_target_active(state, int(player)):
+        for k in (
+            "trade_accept_value",
+            "trade_accept_immediate_build_gain",
+            "trade_accept_should_take",
+        ):
+            weights[k] = 0.0
+    return weights
 
 
 def is_setup_settlement_phase(state: GameState) -> bool:

@@ -23,6 +23,46 @@ from .strategy_metrics import trade_offer_value
 MAX_PLAYER_TRADE_BUNDLE_CARDS = 2
 
 
+_ACTION_INDICES_BY_KIND: dict[str, list[int]] = {}
+for _idx, _action in enumerate(CATALOG.actions):
+    _ACTION_INDICES_BY_KIND.setdefault(_action.kind, []).append(_idx)
+
+_PHASE_ACTION_KINDS: dict[int, tuple[str, ...]] = {
+    int(Phase.SETUP_SETTLEMENT): ("PLACE_SETTLEMENT",),
+    int(Phase.SETUP_ROAD): ("PLACE_ROAD",),
+    int(Phase.PRE_ROLL): ("ROLL_DICE", "PLAY_KNIGHT"),
+    int(Phase.DISCARD): ("DISCARD",),
+    int(Phase.MOVE_ROBBER): ("MOVE_ROBBER",),
+    int(Phase.ROB_PLAYER): ("ROB_PLAYER",),
+    int(Phase.MAIN): (
+        "PLACE_SETTLEMENT",
+        "PLACE_CITY",
+        "PLACE_ROAD",
+        "BUY_DEV_CARD",
+        "PLAY_KNIGHT",
+        "PLAY_ROAD_BUILDING",
+        "PLAY_YEAR_OF_PLENTY",
+        "PLAY_MONOPOLY",
+        "TRADE_ADD_GIVE",
+        "TRADE_ADD_WANT",
+        "BANK_TRADE",
+        "END_TURN",
+    ),
+    int(Phase.TRADE_DRAFT): (
+        "TRADE_ADD_GIVE",
+        "TRADE_ADD_WANT",
+        "TRADE_REMOVE_GIVE",
+        "TRADE_REMOVE_WANT",
+        "PROPOSE_TRADE",
+        "CANCEL_TRADE",
+    ),
+    int(Phase.TRADE_PROPOSED): ("ACCEPT_TRADE", "REJECT_TRADE"),
+    int(Phase.YEAR_OF_PLENTY): ("PLAY_YEAR_OF_PLENTY",),
+    int(Phase.MONOPOLY): ("PLAY_MONOPOLY",),
+    int(Phase.ROAD_BUILDING): ("PLACE_ROAD",),
+}
+
+
 @dataclass
 class StepResult:
     obs: np.ndarray
@@ -52,6 +92,8 @@ class CatanEnv:
         self.rng = np.random.default_rng(seed)
         self.state = new_game_state(seed=seed)
         self._last_mask: np.ndarray | None = None
+        self._last_mask_token: tuple | None = None
+        self._obs_cache: dict[bool, tuple[tuple, np.ndarray]] = {}
         self._discard_remaining = np.zeros(NUM_PLAYERS, dtype=np.int64)
         self._discard_roller = 0
         self._main_actions_this_turn = 0
@@ -66,26 +108,111 @@ class CatanEnv:
         self._discard_roller = 0
         self._main_actions_this_turn = 0
         self._trade_proposals_this_turn = 0
+        self._obs_cache = {}
+        self._last_mask = None
+        self._last_mask_token = None
         self._last_mask = self.action_mask()
         return self.observation(self.full_info_obs), {"action_mask": self._last_mask.copy()}
+
+    def _state_cache_token(self) -> tuple:
+        s = self.state
+        arrays = (
+            s.hex_terrain,
+            s.hex_number,
+            s.hex_pip_count,
+            s.port_type,
+            s.port_vertices,
+            s.vertex_building,
+            s.vertex_owner,
+            s.edge_road,
+            s.edge_owner,
+            s.resources,
+            s.resource_total,
+            s.dev_cards_hidden,
+            s.dev_cards_bought_this_turn,
+            s.knights_played,
+            s.vp_cards_held,
+            s.settlements_left,
+            s.cities_left,
+            s.roads_left,
+            s.has_port,
+            s.longest_road_length,
+            s.has_longest_road,
+            s.has_largest_army,
+            s.actual_vp,
+            s.public_vp,
+            s.public_recent_gain,
+            s.public_recent_spend,
+            s.public_recent_rob_unknown_gain,
+            s.public_recent_rob_unknown_loss,
+            s.public_trade_offers,
+            s.public_trade_accepts,
+            s.public_trade_rejects,
+            s.dev_deck_composition,
+            s.must_discard,
+            s.trade_offer_give,
+            s.trade_offer_want,
+            s.trade_responses,
+            self._discard_remaining,
+        )
+        scalar_fields = (
+            int(s.robber_hex),
+            int(s.dev_deck_remaining),
+            int(s.current_player),
+            int(s.turn_number),
+            int(s.phase),
+            int(s.dice_roll),
+            int(bool(s.has_rolled)),
+            int(bool(s.dev_card_played_this_turn)),
+            int(s.free_roads_remaining),
+            int(s.setup_round),
+            int(bool(s.setup_forward)),
+            int(s.setup_player_order_index),
+            int(s.setup_settlement_vertex),
+            int(s.trade_proposer),
+            int(s.winner),
+            int(self._discard_roller),
+            int(self._main_actions_this_turn),
+            int(self._trade_proposals_this_turn),
+        )
+        return scalar_fields + tuple(arr.tobytes() for arr in arrays)
 
     def observation(self, full_info: bool | None = None) -> np.ndarray:
         from .encoding import encode_observation
 
-        return encode_observation(
-            self.state,
-            full_info=self.full_info_obs if full_info is None else full_info,
-        )
+        full_info_flag = self.full_info_obs if full_info is None else full_info
+        token = self._state_cache_token()
+        cached = self._obs_cache.get(bool(full_info_flag))
+        if cached is not None and cached[0] == token:
+            return cached[1].copy()
+        obs = encode_observation(self.state, full_info=full_info_flag)
+        self._obs_cache[bool(full_info_flag)] = (token, obs)
+        return obs.copy()
+
+    def _candidate_action_indices(self) -> list[int]:
+        kinds = _PHASE_ACTION_KINDS.get(int(self.state.phase))
+        if kinds is None:
+            return list(range(CATALOG.size()))
+        indices: list[int] = []
+        for kind in kinds:
+            indices.extend(_ACTION_INDICES_BY_KIND.get(kind, ()))
+        return indices
 
     def action_mask(self) -> np.ndarray:
+        token = self._state_cache_token()
+        if self._last_mask is not None and self._last_mask_token == token:
+            return self._last_mask.copy()
         mask = np.zeros(CATALOG.size(), dtype=np.int8)
-        for idx, action in enumerate(CATALOG.actions):
+        for idx in self._candidate_action_indices():
+            action = CATALOG.actions[idx]
             if self._is_action_legal(action):
                 mask[idx] = 1
         # Safety fallback to avoid deadlock states with no legal moves.
         if mask.sum() == 0 and self.state.phase == Phase.MAIN:
             mask[CATALOG.encode(Action("END_TURN"))] = 1
-        return mask
+        self._last_mask = mask
+        self._last_mask_token = token
+        return mask.copy()
 
     def step(self, action_id: int) -> StepResult:
         if self.state.phase == Phase.GAME_OVER:
@@ -104,6 +231,9 @@ class CatanEnv:
         player = self.state.current_player
         before_phase = self.state.phase
         self._apply_action(player, action)
+        self._obs_cache = {}
+        self._last_mask = None
+        self._last_mask_token = None
         if before_phase in (Phase.MAIN, Phase.TRADE_DRAFT) and action.kind != "END_TURN":
             self._main_actions_this_turn += 1
         self._update_vp_and_achievements()

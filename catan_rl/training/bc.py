@@ -13,7 +13,7 @@ from ..bots import HeuristicAgent
 from ..env import CatanEnv
 from ..search import SearchDecision, choose_search_action, export_search_decisions_jsonl
 from ..strategy_archetypes import strategy_target_vector
-from ..strategy_metrics import AUX_LABEL_KEYS, strategic_aux_targets, strategic_evaluator_snapshot
+from ..strategy_metrics import AUX_LABEL_KEYS, strategic_aux_target_weights, strategic_aux_targets, strategic_evaluator_snapshot
 
 
 @dataclass
@@ -22,6 +22,7 @@ class BCDataset:
     masks: np.ndarray
     actions: np.ndarray
     aux_targets: dict[str, np.ndarray]
+    aux_target_weights: dict[str, np.ndarray]
     strategy_targets: np.ndarray
 
 
@@ -31,6 +32,7 @@ class SearchDistillDataset:
     masks: np.ndarray
     actions: np.ndarray
     aux_targets: dict[str, np.ndarray]
+    aux_target_weights: dict[str, np.ndarray]
     strategy_targets: np.ndarray
     metadata: dict
 
@@ -45,12 +47,14 @@ def collect_bc_dataset(steps: int, seed: int, env_kwargs: dict | None = None) ->
     mask_buf = []
     act_buf = []
     aux_buf = {k: [] for k in AUX_LABEL_KEYS}
+    aux_weight_buf = {k: [] for k in AUX_LABEL_KEYS}
     strategy_buf = []
     for _ in range(steps):
         state_before = env.state.copy()
         player = int(state_before.current_player)
         snap = strategic_evaluator_snapshot(state_before, player)
-        aux = strategic_aux_targets(snap)
+        aux = strategic_aux_targets(snap, state_before, player)
+        aux_weights = strategic_aux_target_weights(state_before, player)
         strategy_buf.append(strategy_target_vector(state_before, player))
         action = teacher.act(obs, mask)
         obs_buf.append(obs)
@@ -58,6 +62,7 @@ def collect_bc_dataset(steps: int, seed: int, env_kwargs: dict | None = None) ->
         act_buf.append(action)
         for k in AUX_LABEL_KEYS:
             aux_buf[k].append(float(aux[k]))
+            aux_weight_buf[k].append(float(aux_weights[k]))
         res = env.step(action)
         obs = res.obs
         mask = res.info["action_mask"]
@@ -70,6 +75,7 @@ def collect_bc_dataset(steps: int, seed: int, env_kwargs: dict | None = None) ->
         masks=np.asarray(mask_buf, dtype=np.float32),
         actions=np.asarray(act_buf, dtype=np.int64),
         aux_targets={k: np.asarray(v, dtype=np.float32) for k, v in aux_buf.items()},
+        aux_target_weights={k: np.asarray(v, dtype=np.float32) for k, v in aux_weight_buf.items()},
         strategy_targets=np.asarray(strategy_buf, dtype=np.float32),
     )
 
@@ -108,6 +114,7 @@ def collect_search_distill_dataset(
     mask_buf = []
     act_buf = []
     aux_buf = {k: [] for k in AUX_LABEL_KEYS}
+    aux_weight_buf = {k: [] for k in AUX_LABEL_KEYS}
     strategy_buf = []
     decisions: list[SearchDecision] = []
     while len(obs_buf) < int(steps):
@@ -127,13 +134,15 @@ def collect_search_distill_dataset(
         )
         if d is not None:
             snap = strategic_evaluator_snapshot(state_before, player)
-            aux = strategic_aux_targets(snap)
+            aux = strategic_aux_targets(snap, state_before, player)
+            aux_weights = strategic_aux_target_weights(state_before, player)
             obs_buf.append(obs)
             mask_buf.append(mask)
             act_buf.append(int(d.selected_action))
             strategy_buf.append(strategy_target_vector(state_before, player))
             for k in AUX_LABEL_KEYS:
                 aux_buf[k].append(float(aux[k]))
+                aux_weight_buf[k].append(float(aux_weights[k]))
             decisions.append(d)
             action = int(d.selected_action)
         else:
@@ -155,6 +164,7 @@ def collect_search_distill_dataset(
         masks=np.asarray(mask_buf, dtype=np.float32),
         actions=np.asarray(act_buf, dtype=np.int64),
         aux_targets={k: np.asarray(v, dtype=np.float32) for k, v in aux_buf.items()},
+        aux_target_weights={k: np.asarray(v, dtype=np.float32) for k, v in aux_weight_buf.items()},
         strategy_targets=np.asarray(strategy_buf, dtype=np.float32),
         metadata={
             "steps": int(steps),
@@ -177,6 +187,7 @@ def save_search_distill_dataset(path: str | Path, dataset: SearchDistillDataset)
         masks=dataset.masks,
         actions=dataset.actions,
         strategy_targets=dataset.strategy_targets,
+        **{f"auxw_{k}": v for k, v in dataset.aux_target_weights.items()},
         **{f"aux_{k}": v for k, v in dataset.aux_targets.items()},
     )
     meta_path = Path(str(p) + ".meta.json")
@@ -200,6 +211,7 @@ def pretrain_policy_with_search_distill(
             masks=dataset.masks,
             actions=dataset.actions,
             aux_targets=dataset.aux_targets,
+            aux_target_weights=dataset.aux_target_weights,
             strategy_targets=dataset.strategy_targets,
         ),
         epochs=epochs,
@@ -244,8 +256,10 @@ def pretrain_policy_with_bc(
                 losses = []
                 for k in AUX_LABEL_KEYS:
                     tgt = torch.as_tensor(dataset.aux_targets[k][mb], dtype=torch.float32, device=obs_t.device)
+                    tgt_weight = torch.as_tensor(dataset.aux_target_weights[k][mb], dtype=torch.float32, device=obs_t.device)
                     if k in pred_aux:
-                        losses.append(((pred_aux[k] - tgt) ** 2).mean())
+                        denom = torch.clamp(tgt_weight.sum(), min=1.0)
+                        losses.append((((pred_aux[k] - tgt) ** 2) * tgt_weight).sum() / denom)
                 if losses:
                     aux_loss = torch.stack(losses).mean()
                     loss = loss + float(aux_coef) * aux_loss

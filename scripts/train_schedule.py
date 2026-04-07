@@ -39,7 +39,7 @@ from catan_rl.training.self_play import (
     terminal_table_mean_shaping,
     trade_value_shaping,
 )
-from catan_rl.strategy_metrics import strategic_evaluator_snapshot
+from catan_rl.strategy_metrics import strategic_aux_target_weights, strategic_evaluator_snapshot
 from catan_rl.strategy_metrics import AUX_LABEL_KEYS, strategic_aux_targets
 from catan_rl.training.wrappers import PolicyAgent
 
@@ -202,8 +202,10 @@ def _collect_rollout_opponent_mix(
     obs, info = env.reset()
     mask = info["action_mask"]
     buf = {k: [] for k in ("obs", "actions", "logp", "values", "rewards", "dones", "masks")}
-    aux_accum = {"count": 0, **{k: 0.0 for k in AUX_LABEL_KEYS}}
+    aux_accum = {k: 0.0 for k in AUX_LABEL_KEYS}
+    aux_weight_accum = {k: 0.0 for k in AUX_LABEL_KEYS}
     aux_targets = {k: [] for k in AUX_LABEL_KEYS}
+    aux_target_weights = {k: [] for k in AUX_LABEL_KEYS}
     trade_value_accum = {"count": 0, "utility_sum": 0.0, "shaping_sum": 0.0}
     forced_knight_count = 0
     forced_trade_count = 0
@@ -236,13 +238,16 @@ def _collect_rollout_opponent_mix(
                 int(player),
                 threat_dev_card_weight=float(threat_dev_card_weight),
             )
-            aux_vals = strategic_aux_targets(snap)
+            aux_vals = strategic_aux_targets(snap, state_before, int(player))
+            aux_weights = strategic_aux_target_weights(state_before, int(player))
             strategy_targets.append(strategy_target_vector(state_before, int(player)))
-            aux_accum["count"] += 1
             for k in AUX_LABEL_KEYS:
                 val = float(aux_vals[k])
-                aux_accum[k] += val
+                weight = float(aux_weights[k])
+                aux_accum[k] += weight * val
+                aux_weight_accum[k] += weight
                 aux_targets[k].append(val)
+                aux_target_weights[k].append(weight)
             action, logp, value = trainer.act(obs, mask)
             action, setup_override = setup_selection_influence_action(
                 state_before,
@@ -443,21 +448,16 @@ def _collect_rollout_opponent_mix(
     for k in ("logp", "values", "rewards", "dones"):
         buf[k] = np.asarray(buf[k], dtype=np.float32)
     buf["aux_targets"] = {k: np.asarray(v, dtype=np.float32) for k, v in aux_targets.items()}
+    buf["aux_target_weights"] = {k: np.asarray(v, dtype=np.float32) for k, v in aux_target_weights.items()}
     buf["strategy_targets"] = np.asarray(strategy_targets, dtype=np.float32)
     adv, ret = compute_gae(buf["rewards"], buf["values"], buf["dones"], trainer.cfg.gamma, trainer.cfg.lam)
     buf["advantages"] = adv
     buf["returns"] = ret
-    count = max(1, int(aux_accum["count"]))
     buf["aux_label_stats"] = {
-        "city_top_delta_score": float(aux_accum["city_top_delta_score"]) / count,
-        "robber_block_quality": float(aux_accum["robber_block_quality"]) / count,
-        "longest_road_pressure": float(aux_accum["longest_road_pressure"]) / count,
-        "largest_army_pressure": float(aux_accum["largest_army_pressure"]) / count,
-        "ready_road_turns": float(aux_accum["ready_road_turns"]) / count,
-        "ready_settlement_turns": float(aux_accum["ready_settlement_turns"]) / count,
-        "ready_city_turns": float(aux_accum["ready_city_turns"]) / count,
-        "ready_dev_turns": float(aux_accum["ready_dev_turns"]) / count,
+        k: float(aux_accum[k]) / max(1.0, float(aux_weight_accum[k]))
+        for k in AUX_LABEL_KEYS
     }
+    buf["aux_label_counts"] = {k: int(round(float(aux_weight_accum[k]))) for k in AUX_LABEL_KEYS}
     tcount = max(1, int(trade_value_accum["count"]))
     buf["trade_value_stats"] = {
         "mean_trade_utility": float(trade_value_accum["utility_sum"]) / tcount,
@@ -524,6 +524,8 @@ def main() -> None:
     parser.add_argument("--trade-action-mode", choices=["guided", "full"], default="guided")
     parser.add_argument("--max-player-trade-proposals-per-turn", type=int, default=None)
     parser.add_argument("--ppo-lr", type=float, default=3e-4)
+    parser.add_argument("--ppo-lr-start", type=float, default=None)
+    parser.add_argument("--ppo-lr-end", type=float, default=None)
     parser.add_argument("--ppo-ent-coef", type=float, default=0.01)
     parser.add_argument("--ppo-ent-coef-start", type=float, default=None)
     parser.add_argument("--ppo-ent-coef-end", type=float, default=None)
@@ -531,6 +533,7 @@ def main() -> None:
     parser.add_argument("--ppo-minibatch-size", type=int, default=64)
     parser.add_argument("--ppo-aux-coef", type=float, default=0.0)
     parser.add_argument("--ppo-strategy-coef", type=float, default=0.0)
+    parser.add_argument("--ppo-max-grad-norm", type=float, default=0.5)
     parser.add_argument("--setup-phase-loss-weight", type=float, default=1.0)
     parser.add_argument("--collapse-entropy-threshold", type=float, default=0.25)
     parser.add_argument("--collapse-strict-drop", type=float, default=0.05)
@@ -632,6 +635,7 @@ def main() -> None:
             minibatch_size=args.ppo_minibatch_size,
             aux_coef=args.ppo_aux_coef,
             strategy_coef=args.ppo_strategy_coef,
+            max_grad_norm=args.ppo_max_grad_norm,
             setup_phase_loss_weight=args.setup_phase_loss_weight,
         ),
     )
@@ -667,6 +671,12 @@ def main() -> None:
             trainer.cfg.ent_coef = float(
                 args.ppo_ent_coef_start + progress * (args.ppo_ent_coef_end - args.ppo_ent_coef_start)
             )
+        if args.ppo_lr_start is not None and args.ppo_lr_end is not None:
+            progress = (update - 1) / max(1, args.total_updates - 1)
+            curr_lr = float(args.ppo_lr_start + progress * (args.ppo_lr_end - args.ppo_lr_start))
+            trainer.cfg.lr = curr_lr
+            for group in trainer.optim.param_groups:
+                group["lr"] = curr_lr
 
         env.seed = int(rng.integers(0, 1_000_000))
         if args.use_opponent_mixture:
@@ -854,8 +864,10 @@ def main() -> None:
             "init_checkpoint": args.init_checkpoint,
             "bc_stats": bc_stats,
             "ent_coef": float(trainer.cfg.ent_coef),
+            "lr": float(trainer.optim.param_groups[0]["lr"]),
             "aux_coef": float(trainer.cfg.aux_coef),
             "strategy_coef": float(trainer.cfg.strategy_coef),
+            "max_grad_norm": float(trainer.cfg.max_grad_norm),
             "forced_knight_bootstrap_count": int(batch.get("forced_knight_bootstrap_count", 0)),
             "forced_trade_bootstrap_count": int(batch.get("forced_trade_bootstrap_count", 0)),
             "setup_selection_override_count": int(batch.get("setup_selection_override_count", 0)),

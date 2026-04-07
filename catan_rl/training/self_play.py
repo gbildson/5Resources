@@ -22,6 +22,7 @@ from ..strategy_metrics import (
     trade_accept_should_avoid_proposer,
     setup_choice_metrics,
     setup_settlement_score,
+    strategic_aux_target_weights,
     strategic_aux_targets,
     strategic_evaluator_snapshot,
     trade_accept_value,
@@ -1051,8 +1052,10 @@ def collect_rollout(
     obs, info = env.reset()
     mask = info["action_mask"]
     buf = {k: [] for k in ("obs", "actions", "logp", "values", "rewards", "dones", "masks")}
-    aux_accum = {"count": 0, **{k: 0.0 for k in AUX_LABEL_KEYS}}
+    aux_accum = {k: 0.0 for k in AUX_LABEL_KEYS}
+    aux_weight_accum = {k: 0.0 for k in AUX_LABEL_KEYS}
     aux_targets = {k: [] for k in AUX_LABEL_KEYS}
+    aux_target_weights = {k: [] for k in AUX_LABEL_KEYS}
     trade_value_accum = {"count": 0, "utility_sum": 0.0, "shaping_sum": 0.0}
     forced_knight_count = 0
     forced_trade_count = 0
@@ -1065,13 +1068,16 @@ def collect_rollout(
         prev_resource_total = int(env.state.resource_total[player])
         state_before = env.state.copy()
         snap = strategic_evaluator_snapshot(state_before, int(player), threat_dev_card_weight=float(threat_dev_card_weight))
-        aux_vals = strategic_aux_targets(snap)
+        aux_vals = strategic_aux_targets(snap, state_before, int(player))
+        aux_weights = strategic_aux_target_weights(state_before, int(player))
         strategy_targets.append(strategy_target_vector(state_before, int(player)))
-        aux_accum["count"] += 1
         for k in AUX_LABEL_KEYS:
             val = float(aux_vals[k])
-            aux_accum[k] += val
+            weight = float(aux_weights[k])
+            aux_accum[k] += weight * val
+            aux_weight_accum[k] += weight
             aux_targets[k].append(val)
+            aux_target_weights[k].append(weight)
         action, logp, value = trainer.act(obs, mask)
         action, setup_override = setup_selection_influence_action(
             state_before,
@@ -1207,21 +1213,16 @@ def collect_rollout(
     for k in ("logp", "values", "rewards", "dones"):
         buf[k] = np.asarray(buf[k], dtype=np.float32)
     buf["aux_targets"] = {k: np.asarray(v, dtype=np.float32) for k, v in aux_targets.items()}
+    buf["aux_target_weights"] = {k: np.asarray(v, dtype=np.float32) for k, v in aux_target_weights.items()}
     buf["strategy_targets"] = np.asarray(strategy_targets, dtype=np.float32)
     adv, ret = compute_gae(buf["rewards"], buf["values"], buf["dones"], trainer.cfg.gamma, trainer.cfg.lam)
     buf["advantages"] = adv
     buf["returns"] = ret
-    count = max(1, int(aux_accum["count"]))
     buf["aux_label_stats"] = {
-        "city_top_delta_score": float(aux_accum["city_top_delta_score"]) / count,
-        "robber_block_quality": float(aux_accum["robber_block_quality"]) / count,
-        "longest_road_pressure": float(aux_accum["longest_road_pressure"]) / count,
-        "largest_army_pressure": float(aux_accum["largest_army_pressure"]) / count,
-        "ready_road_turns": float(aux_accum["ready_road_turns"]) / count,
-        "ready_settlement_turns": float(aux_accum["ready_settlement_turns"]) / count,
-        "ready_city_turns": float(aux_accum["ready_city_turns"]) / count,
-        "ready_dev_turns": float(aux_accum["ready_dev_turns"]) / count,
+        k: float(aux_accum[k]) / max(1.0, float(aux_weight_accum[k]))
+        for k in AUX_LABEL_KEYS
     }
+    buf["aux_label_counts"] = {k: int(round(float(aux_weight_accum[k]))) for k in AUX_LABEL_KEYS}
     tcount = max(1, int(trade_value_accum["count"]))
     buf["trade_value_stats"] = {
         "mean_trade_utility": float(trade_value_accum["utility_sum"]) / tcount,

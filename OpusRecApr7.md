@@ -223,23 +223,74 @@ This is a medium-complexity change with potentially significant representational
 The approach is fundamentally sound and well-executed. The main risks are the ones common to all heavily-shaped RL systems: the feature engineering and reward shaping that enable learning in the short term may constrain the ceiling in the long term. The most impactful near-term improvements are likely on the behavioral side (trade acceptance, opponent modeling) rather than architectural, since the graph entity phase-aware hybrid is already a strong inductive bias for this domain.
 
 ### Quick-win fixes (high impact, low effort)
-- **I**: Add gradient clipping (1 line)
-- **L**: Add LR schedule (extend existing entropy schedule pattern)
-- **O**: Add seat-position feature to observation (small encoding change)
+- **I**: Add gradient clipping (1 line) — checkpoint compatible
+- **L**: Add LR schedule (extend existing entropy schedule pattern) — checkpoint compatible
+- **O**: Add seat-position feature to observation (small encoding change) — changes `obs_dim`; workaround: pad input weight matrix with zeros to preserve existing representations, then fine-tune
 
 ### Medium-effort improvements (significant impact)
-- **A**: Trade responder aux head
-- **B**: Opponent strategy prediction head
-- **H**: Per-player GAE computation
-- **J**: Phase-dispatched action mask
-- **K**: Separate value head layers
-- **M**: Incremental longest-road updates
-- **P**: Cached engineered features
+- **A**: Trade responder aux head — checkpoint compatible (new head loads randomly, backbone intact via `strict=False`)
+- **B**: Opponent strategy prediction head — checkpoint compatible (same as A)
+- **H**: Per-player GAE computation — checkpoint compatible (training loop change only)
+- **J**: Phase-dispatched action mask — checkpoint compatible (env optimization only)
+- **K**: Separate value head layers — checkpoint compatible; policy unaffected, value re-converges through new layers (short warmup, not full retrain)
+- **M**: Incremental longest-road updates — checkpoint compatible (env optimization only)
+- **P**: Cached engineered features — checkpoint compatible (env optimization only)
 
 ### Larger structural improvements (high ceiling impact)
-- **C**: Engineered feature ablation
-- **D**: Hierarchical action decomposition
-- **E**: Aux prediction replacing reward shaping
-- **Q**: Population-based training
-- **R**: Sequential discard decomposition
-- **T**: Attention in graph message passing
+- **C**: Engineered feature ablation — **REQUIRES RETRAIN** if features are removed (changes `obs_dim`). Workaround: zero features at runtime while keeping `obs_dim` constant to test which features are load-bearing before committing to removal.
+- **D**: Hierarchical action decomposition — **REQUIRES RETRAIN** (restructures action space; no checkpoint path)
+- **E**: Aux prediction replacing reward shaping — checkpoint compatible (new aux heads initialize randomly; shaping removal is a hyperparameter change)
+- **Q**: Population-based training — checkpoint compatible (uses existing checkpoints as seeds)
+- **R**: Sequential discard decomposition — **REQUIRES RETRAIN** (changes `action_dim` and phase flow)
+- **T**: Attention in graph message passing — **REQUIRES RETRAIN** (replaces core graph layer internals)
+
+### Checkpoint compatibility summary
+
+| Category | Recommendations |
+|----------|----------------|
+| Fully compatible, continue training | A, B, E, F, H, I, J, L, M, N, P, Q |
+| New layers added, short re-convergence | K, O (with weight padding) |
+| Requires full retrain from scratch | C (if features removed), D, R, T |
+| Depends on implementation | G (aux head = compatible; recurrent/attention over history = retrain) |
+
+---
+
+## External Review (GPT 5.4, Apr 7)
+
+### Corrections to this document
+
+**Checkpoint compatibility is too optimistic in places.** In this project, anything that changes `obs_dim`, `action_dim`, or phase/action semantics has repeatedly turned into a practical retrain boundary, even when a theoretical partial-load path exists. Items like **O** (seat-position feature) and **K** (value-head restructuring) should be treated as fundamental changes requiring explicit approval and fresh validation, not casual drop-ins.
+
+**The document overweights architectural concerns relative to the current bottleneck.** The strongest evidence says `phase_aware_v5` finally has healthy behavior: setup, knights, and trades are all alive. Jumping to hierarchy (D), search (F), or large feature ablations (C) risks disrupting a line that's working. The highest-value next work is still behavioral.
+
+**The flat-action-space critique is directionally right but not the current priority.** The discard space and large mask are real costs, but they are not what's currently suppressing strength. The draft-trade loop bug was far more impactful than raw action-count issues.
+
+### What the review endorsed as strong
+
+- The overall assessment is fair and correctly recognizes that `phase_aware_v5` results are meaningful, not accidental.
+- **B** (opponent modeling) is probably the best medium-term idea — the next ceiling is "who is the most dangerous opponent right now?" not "more setup shaping."
+- **A** (trade responder improvement) is high leverage now that trading is alive. Direct evidence exists that responder conservatism is leaving value on the table.
+- Low-risk engineering fixes (**I**, **J**, **L**, **M**, **P**) are sensible once behavior is stable.
+- The addendum on road race, army race, and latent threat (from Context_Apr7.md) is consistent with what traces are showing.
+
+### Revised priority ordering
+
+| Priority | Recommendation | Rationale |
+|----------|---------------|-----------|
+| **1 — Do now** | **B**: Opponent modeling / predictive threat | Closest to actual current ceiling. Robber, trade, and denial decisions need a better forecast of who is about to win and how. |
+| **2 — Do now** | **A**: Trade responder improvement | Trading is alive; direct evidence of responder conservatism leaving value on the table. No longer speculative. |
+| **3 — Do soon** | **I, J, L, M, P**: Stability/perf fixes | Good "engineering tax reduction" items. Low risk, checkpoint compatible. |
+| **4 — Do later** | **D, F, T**: Hierarchy, search, attention | May raise the ceiling, but exactly the sort of structural changes that can reset progress and make comparisons murky. |
+
+### Items to defer or handle carefully
+
+| Recommendation | Reviewer position |
+|----------------|-------------------|
+| **C** (engineered-feature ablation) | True in principle, risky in practice right now. Defer. |
+| **K** (separate value layers) | Maybe useful, but stabilize the current strong line first. |
+| **O** (seat-position feature) | Plausible, but changes the observation contract — treat as fundamental, not a quick win. |
+| **H** (per-player GAE) | Intellectually appealing, but need evidence it's actually limiting the current line before touching it. |
+
+### Verdict
+
+OpusRecApr7.md is thoughtful and mostly good. Its strongest recommendations are opponent modeling, responder-trade improvement, and low-risk training/runtime hygiene fixes. The larger architectural refactors should be deferred until the current `phase_aware_v5` line has been exploited more fully.

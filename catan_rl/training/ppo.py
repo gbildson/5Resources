@@ -1043,6 +1043,7 @@ class PPOConfig:
     batch_size: int = 256
     minibatch_size: int = 64
     setup_phase_loss_weight: float = 1.0
+    max_grad_norm: float = 0.5
 
 
 class PPOTrainer:
@@ -1078,13 +1079,17 @@ class PPOTrainer:
             k: torch.as_tensor(v, dtype=torch.float32)
             for k, v in batch.get("aux_targets", {}).items()
         }
+        aux_target_weights = {
+            k: torch.as_tensor(v, dtype=torch.float32)
+            for k, v in batch.get("aux_target_weights", {}).items()
+        }
         strategy_targets = torch.as_tensor(batch["strategy_targets"], dtype=torch.float32) if "strategy_targets" in batch else None
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
         phase_ids = _phase_ids_from_obs(obs)
 
         n = obs.shape[0]
         idx = np.arange(n)
-        logs = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "aux_loss": 0.0, "strategy_loss": 0.0}
+        logs = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "aux_loss": 0.0, "strategy_loss": 0.0, "grad_norm": 0.0}
         updates = 0
         self.model.train()
         for _ in range(self.cfg.epochs):
@@ -1119,7 +1124,13 @@ class PPOTrainer:
                     losses = []
                     for k, tgt in aux_targets.items():
                         if k in pred_aux:
-                            losses.append(((pred_aux[k] - tgt[mb]) ** 2).mean())
+                            weights = aux_target_weights.get(k)
+                            if weights is None:
+                                losses.append(((pred_aux[k] - tgt[mb]) ** 2).mean())
+                            else:
+                                mb_weights = weights[mb]
+                                denom = torch.clamp(mb_weights.sum(), min=1.0)
+                                losses.append((((pred_aux[k] - tgt[mb]) ** 2) * mb_weights).sum() / denom)
                     if losses:
                         aux_loss = torch.stack(losses).mean()
                 if self.cfg.strategy_coef > 0.0 and strategy_targets is not None and hasattr(self.model, "predict_strategy"):
@@ -1136,6 +1147,7 @@ class PPOTrainer:
 
                 self.optim.zero_grad()
                 loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=float(self.cfg.max_grad_norm))
                 self.optim.step()
 
                 logs["policy_loss"] += float(policy_loss.item())
@@ -1143,6 +1155,7 @@ class PPOTrainer:
                 logs["entropy"] += float(entropy.item())
                 logs["aux_loss"] += float(aux_loss.item())
                 logs["strategy_loss"] += float(strategy_loss.item())
+                logs["grad_norm"] += float(grad_norm.item() if hasattr(grad_norm, "item") else grad_norm)
                 updates += 1
 
         for k in logs:
