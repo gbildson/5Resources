@@ -1,7 +1,7 @@
 
 .venv/bin/python scripts/trace_game.py \
-  --checkpoint phase_aware_v5/cycle_7/branch_A/checkpoints/policy_u10.pt \
-  --seed 134 \
+  --checkpoint phase_aware_v5/cycle_28/branch_C/checkpoints/policy_u20.pt \
+  --seed 136 \
   --model-players 0,1,2,3 \
   --max-main-actions-per-turn 10 \
   --trade-action-mode guided \
