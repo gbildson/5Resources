@@ -117,6 +117,45 @@ def _print_policy_strategy_mixture(top: list[tuple[str, float]]) -> None:
     print("  policy_strategy_top3:", txt)
 
 
+def _policy_aux_predictions(model: torch.nn.Module, obs: np.ndarray) -> dict[str, float]:
+    if not hasattr(model, "predict_aux"):
+        return {}
+    with torch.no_grad():
+        obs_t = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
+        pred_aux = model.predict_aux(obs_t)
+    wanted = (
+        "trade_accept_value",
+        "trade_accept_immediate_build_gain",
+        "trade_accept_should_take",
+        "opponent_danger_opp1",
+        "opponent_danger_opp2",
+        "opponent_danger_opp3",
+    )
+    out: dict[str, float] = {}
+    for key in wanted:
+        val = pred_aux.get(key)
+        if val is None:
+            continue
+        out[key] = float(val.squeeze(0).item())
+    return out
+
+
+def _print_policy_aux_predictions(aux_preds: dict[str, float], phase: str) -> None:
+    if not aux_preds:
+        return
+    opp_keys = ("opponent_danger_opp1", "opponent_danger_opp2", "opponent_danger_opp3")
+    if any(k in aux_preds for k in opp_keys):
+        txt = " ".join(f"opp{i + 1}={float(aux_preds.get(k, 0.0)):+.3f}" for i, k in enumerate(opp_keys))
+        print("  policy_opp_danger:", txt)
+    if phase == Phase.TRADE_PROPOSED.name:
+        trade_bits = []
+        for key in ("trade_accept_value", "trade_accept_immediate_build_gain", "trade_accept_should_take"):
+            if key in aux_preds:
+                trade_bits.append(f"{key}={float(aux_preds[key]):+.3f}")
+        if trade_bits:
+            print("  policy_trade_response_aux:", " ".join(trade_bits))
+
+
 def _print_setup(env: CatanEnv) -> None:
     s = env.state
     print("=== Setup ===")
@@ -166,6 +205,7 @@ def _record_trade_event(
     phase: str,
     action_id: int,
     state_before,
+    aux_preds: dict[str, float] | None = None,
 ) -> None:
     action = CATALOG.decode(action_id)
     if action.kind not in TRADE_KINDS:
@@ -221,6 +261,18 @@ def _record_trade_event(
             bank_trade_value(state_before, int(player), int(give_r), int(give_n), int(want_r))
         )
 
+    if aux_preds:
+        for key in (
+            "trade_accept_value",
+            "trade_accept_immediate_build_gain",
+            "trade_accept_should_take",
+            "opponent_danger_opp1",
+            "opponent_danger_opp2",
+            "opponent_danger_opp3",
+        ):
+            if key in aux_preds:
+                rec[f"pred_{key}"] = float(aux_preds[key])
+
     events.append(rec)
 
 
@@ -256,6 +308,8 @@ def _print_trade_summary(events: list[dict]) -> None:
     proposer_offer_utils_on_accept = [float(e["proposer_offer_utility"]) for e in events if "proposer_offer_utility" in e]
     bank_utils = [float(e["bank_trade_utility"]) for e in events if "bank_trade_utility" in e]
     response_events = [e for e in events if e["kind"] in {"ACCEPT_TRADE", "REJECT_TRADE"}]
+    pred_accept_values = [float(e["pred_trade_accept_value"]) for e in response_events if "pred_trade_accept_value" in e]
+    pred_should_take = [float(e["pred_trade_accept_should_take"]) for e in response_events if "pred_trade_accept_should_take" in e]
     positive_accept_util_count = sum(float(e.get("response_accept_utility", -1.0)) > 0.0 for e in response_events)
     immediate_unlock_count = sum(bool(e.get("immediate_unlock", False)) for e in response_events)
     avoid_proposer_count = sum(bool(e.get("avoid_proposer", False)) for e in response_events)
@@ -265,7 +319,7 @@ def _print_trade_summary(events: list[dict]) -> None:
     rejected_unlock_count = sum(
         e["kind"] == "REJECT_TRADE" and bool(e.get("immediate_unlock", False)) for e in response_events
     )
-    if proposer_utils or best_responder_utils or accepter_utils or proposer_offer_utils_on_accept or bank_utils:
+    if proposer_utils or best_responder_utils or accepter_utils or proposer_offer_utils_on_accept or bank_utils or pred_accept_values:
         print("\nutility_estimates:")
         if proposer_utils:
             print(f"  propose_mean_proposer_utility={float(np.mean(proposer_utils)):.3f}")
@@ -280,6 +334,10 @@ def _print_trade_summary(events: list[dict]) -> None:
             )
         if bank_utils:
             print(f"  bank_trade_mean_utility={float(np.mean(bank_utils)):.3f}")
+        if pred_accept_values:
+            print(f"  response_pred_mean_accept_value={float(np.mean(pred_accept_values)):.3f}")
+        if pred_should_take:
+            print(f"  response_pred_mean_should_take={float(np.mean(pred_should_take)):.3f}")
     if response_events:
         print("\nresponse_diagnostics:")
         print(
@@ -313,6 +371,17 @@ def _print_trade_summary(events: list[dict]) -> None:
             util_bits.append(f"unlock={bool(e['immediate_unlock'])}")
         if "avoid_proposer" in e:
             util_bits.append(f"avoid={bool(e['avoid_proposer'])}")
+        if "pred_trade_accept_value" in e:
+            util_bits.append(f"pred_acc_u={float(e['pred_trade_accept_value']):+.3f}")
+        if "pred_trade_accept_should_take" in e:
+            util_bits.append(f"pred_take={float(e['pred_trade_accept_should_take']):+.3f}")
+        if "pred_opponent_danger_opp1" in e:
+            util_bits.append(
+                "pred_danger="
+                f"[{float(e['pred_opponent_danger_opp1']):+.2f},"
+                f"{float(e.get('pred_opponent_danger_opp2', 0.0)):+.2f},"
+                f"{float(e.get('pred_opponent_danger_opp3', 0.0)):+.2f}]"
+            )
         if "bundle_give" in e and "bundle_want" in e:
             util_bits.append(f"give={e['bundle_give']}")
             util_bits.append(f"want={e['bundle_want']}")
@@ -999,6 +1068,11 @@ def main() -> None:
         help="For strategy-aware models, print top-3 predicted strategy mixture each policy step.",
     )
     parser.add_argument(
+        "--show-policy-aux-predictions",
+        action="store_true",
+        help="Print selected auxiliary-head predictions for policy turns, including trade responder and opponent danger.",
+    )
+    parser.add_argument(
         "--model-arch",
         choices=[
             "mlp",
@@ -1114,10 +1188,12 @@ def main() -> None:
                     rng=policy_rng,
                 )
                 strat_top = _policy_strategy_mixture(model, obs) if args.show_policy_strategy_mixture else []
+                aux_preds = _policy_aux_predictions(model, obs) if args.show_policy_aux_predictions else {}
             else:
                 action_id = int(bot.act(obs, mask))
                 top = []
                 strat_top = []
+                aux_preds = {}
             action = CATALOG.decode(action_id)
             state_before = env.state.copy()
             record_dev_timing_step(dev_timing_tracker, state_before, int(player), str(action.kind))
@@ -1140,6 +1216,8 @@ def main() -> None:
                 _print_top_actions(top)
             if strat_top:
                 _print_policy_strategy_mixture(strat_top)
+            if aux_preds:
+                _print_policy_aux_predictions(aux_preds, phase)
             if args.show_setup_shaping_events:
                 _print_setup_shaping_event(step=step, player=player, action_id=action_id, state_before=state_before)
             opening_event = _record_opening_event(
@@ -1165,6 +1243,7 @@ def main() -> None:
                 phase=phase,
                 action_id=action_id,
                 state_before=state_before,
+                aux_preds=aux_preds,
             )
             _record_robber_knight_event(
                 robber_knight_events,
@@ -1189,6 +1268,7 @@ def main() -> None:
                             "action": _format_action(action),
                             "top5": top,
                             "policy_strategy_top3": strat_top,
+                            "policy_aux_predictions": aux_preds,
                             "reward": float(result.reward),
                             "winner": int(result.info.get("winner", -1)),
                             "public_vp": env.state.public_vp.tolist(),

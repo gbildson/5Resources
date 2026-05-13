@@ -291,6 +291,50 @@ The approach is fundamentally sound and well-executed. The main risks are the on
 | **O** (seat-position feature) | Plausible, but changes the observation contract — treat as fundamental, not a quick win. |
 | **H** (per-player GAE) | Intellectually appealing, but need evidence it's actually limiting the current line before touching it. |
 
+### Implementation status (post-review)
+
+Implemented from this review:
+
+- **A**: Trade responder improvement
+  - Added checkpoint-compatible responder-side auxiliary targets for `trade_accept_value`, `trade_accept_immediate_build_gain`, and `trade_accept_should_take`.
+  - These are masked/zero-weighted outside responder rows in `TRADE_PROPOSED`.
+- **B**: Opponent modeling / predictive threat
+  - Implemented in a lightweight checkpoint-compatible form via opponent-danger auxiliary targets (`opponent_danger_opp1/2/3`) based on public VP, road, army, cards, and latent dev-threat proxies.
+  - This is not yet a full "predict opponent next build" head, but it does directly support robber / denial / trade-avoidance decisions.
+- **I**: Gradient clipping
+  - Added PPO gradient clipping with `clip_grad_norm_(..., 0.5)`.
+- **J**: Phase-dispatched action mask
+  - `action_mask()` now checks only the action families relevant to the current phase instead of scanning the entire catalog every time.
+- **L**: LR schedule
+  - Added optional PPO LR start/end scheduling in `train_schedule.py`, parallel to the existing entropy schedule.
+- **P**: Cached env/model-input support
+  - Added lightweight observation and mask caching in the environment with state-token validation to avoid stale results when state is mutated externally.
+
+Partially implemented / implemented in spirit:
+
+- **E**: Replace some reward shaping with auxiliary prediction objectives
+  - New auxiliary heads were added so representation learning carries more of the burden.
+  - Reward shaping has not been broadly removed yet; this is an additive first step, not a full replacement.
+- **B** / **G**: Opponent modeling
+  - Current implementation captures public-information threat scoring, but does not yet model richer opponent behavioral patterns over time.
+
+Not yet implemented:
+
+- **C**: Engineered-feature ablation
+- **D**: Hierarchical action decomposition
+- **F**: Limited search at play time
+- **H**: Per-player GAE
+- **K**: Separate value-head layers
+- **M**: Incremental longest-road updates
+- **O**: Seat-position feature
+- **Q**: Population-based training
+- **R**: Sequential discard decomposition
+- **T**: Attention in graph message passing
+
+Validation tooling added:
+
+- `trace_game.py` / `trace.sh` now expose the new policy strategy mixture plus the responder and opponent-danger auxiliary predictions, so post-change league traces are easier to inspect.
+
 ### Verdict
 
 OpusRecApr7.md is thoughtful and mostly good. Its strongest recommendations are opponent modeling, responder-trade improvement, and low-risk training/runtime hygiene fixes. The larger architectural refactors should be deferred until the current `phase_aware_v5` line has been exploited more fully.
